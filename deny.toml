@@ -1,0 +1,295 @@
+# cargo-deny configuration for axiom-edge.
+#
+# Schema reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+# Goal: a working release gate, not a perpetually-red CI job. We curate the
+# license allow-list to what the current tree actually pulls in, allow the
+# small set of git sources the project pins on purpose (openvm, stark-backend,
+# poseidon2, halo2curves-axiom), and document the two unfixable transitive
+# advisories with dated rationale.
+
+[graph]
+all-features = false
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+
+[output]
+feature-depth = 1
+
+# -----------------------------------------------------------------------------
+# Advisories — surface RUSTSEC entries; document the two we can't push a fix
+# for upstream. Review on every bump of openvm / stark-backend.
+# -----------------------------------------------------------------------------
+[advisories]
+version = 2
+yanked = "warn"
+# Each ignore is a transitive dep we can't push a fix for from this repo. The
+# direct chain runs through the openvm / stark-backend / halo2 graph; re-review
+# on every bump of those pins and after 2026-09-01.
+ignore = [
+    # bincode 1.x — workspace pins for backwards-compatible wire format.
+    # Migration to 2.x ripples through proof/protocol and openvm-stark-sdk.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; migration tracked as follow-up" },
+    # rand 0.8.x soundness note covers a custom-global-logger path we do not
+    # exercise. Awaiting openvm/stark-backend bump to rand 0.9.
+    { id = "RUSTSEC-2026-0097", reason = "rand 0.8.x; affected path not exercised; transitive via openvm" },
+    # ansi_term, derivative, generational-arena, paste — all transitive via the
+    # halo2 / openvm graph; replacing them is upstream's call.
+    { id = "RUSTSEC-2021-0139", reason = "ansi_term unmaintained; transitive via halo2" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; transitive via halo2/openvm" },
+    { id = "RUSTSEC-2024-0014", reason = "generational-arena unmaintained; transitive via openvm" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via openvm/p3" },
+    # proc-macro-error2 — build-time proc-macro dep of getset, pulled in by the
+    # openvm v2.0.0-rc.2 circuit crates. Upstream-unmaintained, no safe upgrade;
+    # build-only (not in any shipped artifact).
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; build-time, transitive via getset -> openvm rc.2" },
+]
+
+# -----------------------------------------------------------------------------
+# Licenses — list everything actually present in `cargo metadata` today.
+# `clarify` entries cover git deps that omit Cargo.toml's `license` field but
+# ship a LICENSE file in their repo (all MIT per upstream).
+# -----------------------------------------------------------------------------
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "0BSD",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MIT-0",
+    "Unlicense",
+    "Zlib",
+]
+
+# Workspace path crates (publish = false) — allow them unconditionally.
+[licenses.private]
+ignore = true
+
+# Git deps without a Cargo.toml `license` field. Upstream LICENSE files are MIT
+# (openvm-org/openvm, openvm-org/stark-backend) or MIT (poseidon2, halo2). We
+# do not hash-pin the LICENSE blobs here because the git revs are pinned and
+# the LICENSE file at those revs has been inspected by hand; revisit at bump.
+[[licenses.clarify]]
+crate = "openvm-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-continuations"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-sdk-config"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-verify-stark-host"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-transpiler"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-platform"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-custom-insn"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-macros-common"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-rv32-adapters"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-rv32im-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-rv32im-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-rv32im-transpiler"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-algebra-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-algebra-complex-macros"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-algebra-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-algebra-moduli-macros"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-algebra-transpiler"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-bigint-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-bigint-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-bigint-transpiler"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-deferral-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-deferral-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-deferral-transpiler"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-ecc-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-ecc-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-ecc-sw-macros"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-ecc-transpiler"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-keccak256-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-keccak256-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-keccak256-transpiler"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-pairing-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-pairing-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-pairing-transpiler"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-recursion-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-recursion-circuit-derive"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-sha2-air"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-sha2-circuit"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-sha2-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-sha2-transpiler"
+expression = "MIT"
+license-files = []
+
+# stark-backend group (https://github.com/openvm-org/stark-backend) — MIT.
+[[licenses.clarify]]
+crate = "openvm-stark-backend"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-stark-sdk"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-cpu-backend"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-cuda-builder"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-codec-derive"
+expression = "MIT"
+license-files = []
+
+# HorizenLabs/poseidon2 (zkhash). Upstream LICENSE is MIT.
+[[licenses.clarify]]
+crate = "zkhash"
+expression = "MIT"
+license-files = []
+
+# halo2 0.1.0-beta.2 on crates.io ships without a `license` field; the
+# repository is dual-licensed MIT OR Apache-2.0.
+[[licenses.clarify]]
+crate = "halo2"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+# -----------------------------------------------------------------------------
+# Bans — no policy yet. Section kept minimal; revisit when graph stabilises.
+# -----------------------------------------------------------------------------
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+highlight = "all"
+
+# -----------------------------------------------------------------------------
+# Sources — restrict to crates.io and the git sources we pin on purpose.
+# -----------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/openvm-org/openvm.git",
+    "https://github.com/openvm-org/stark-backend.git",
+    "https://github.com/axiom-crypto/halo2curves.git",
+]

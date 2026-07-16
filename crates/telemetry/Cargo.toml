@@ -1,0 +1,28 @@
+[package]
+name = "telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Tracing and OpenTelemetry setup for Axiom Edge (internal)"
+
+[dependencies]
+eyre = { workspace = true }
+
+# HTTP (for header injection/extraction across the manager-worker call chain)
+axum = { workspace = true }
+reqwest = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+# OpenTelemetry
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }

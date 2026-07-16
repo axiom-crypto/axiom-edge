@@ -1,0 +1,43 @@
+[server]
+listen_addr = "{{ manager_listen_addr }}"
+num_workers = {{ num_workers }}
+
+[provers]
+max_app_provers = {{ max_app_provers }}
+max_leaf_provers = {{ max_leaf_provers }}
+max_internal_provers = {{ max_internal_provers }}
+
+[proof]
+leaf_pack_threshold = {{ leaf_pack_threshold }}
+timeout_secs = {{ timeout_secs }}
+leaf_arity = {{ leaf_arity }}
+internal_arity = {{ internal_arity }}
+{% if persist_final_proofs_dir %}
+persist_final_proofs_dir = "{{ persist_final_proofs_dir }}"
+{% endif %}
+{% if compress_persisted_final_proofs %}
+compress_persisted_final_proofs = true
+{% endif %}
+{% if persist_leaf_failure_app_proofs_dir %}
+persist_leaf_failure_app_proofs_dir = "{{ persist_leaf_failure_app_proofs_dir }}"
+{% endif %}
+
+{% if lifecycle_webhook_url %}
+# Generic proof-lifecycle webhook. The manager POSTs a JSON event
+# (queued / proving / completed) to this URL on each transition; an external
+# consumer (e.g. a reporter sidecar) translates them. The manager
+# itself is destination-agnostic.
+[lifecycle]
+webhook_url = "{{ lifecycle_webhook_url }}"
+
+{% endif %}
+[metrics]
+output_dir = "{{ metrics_output_dir }}"
+# "host.docker.internal" is mapped to the host gateway via extra_hosts in
+# docker/docker-compose.yml so the default endpoint resolves to an OTLP/HTTP
+# collector running on the host. Metrics export is best-effort — if nothing
+# is listening there, the manager drops metrics silently.
+endpoint = "{{ metrics_endpoint }}"
+
+[telemetry]
+log_level = "{{ log_level }}"

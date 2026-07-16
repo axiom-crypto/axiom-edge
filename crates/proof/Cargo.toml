@@ -1,0 +1,35 @@
+[package]
+name = "proof"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Proof type definitions and encode/decode helpers (internal)"
+
+[features]
+default = []
+# Substitute mock proof types for testing without real prover dependencies.
+mock-provers = []
+# Enable root and EVM proof types/helpers.
+evm-prove = [
+    "sdk-v2/evm-prove",
+    "sdk-v2/root-prover",
+    "dep:continuations-v2",
+    "continuations-v2/root-prover",
+]
+
+[dependencies]
+# Serialization
+bincode = { workspace = true }
+serde = { workspace = true }
+
+# Utilities
+eyre = { workspace = true }
+
+# OpenVM proof types (real-prover default)
+sdk-v2 = { workspace = true }
+continuations-v2 = { workspace = true, optional = true }
+openvm-stark-backend = { workspace = true }

@@ -1,0 +1,50 @@
+# Keep build context small and avoid copying secrets/artifacts into image layers.
+# Mirrors the sensitive/large entries in .gitignore. Do not exclude anything the
+# Dockerfiles actually COPY (Rust sources, Cargo.toml/Cargo.lock, config/ except
+# config/generated, docker/docker-entrypoint.sh).
+
+# Build outputs
+target/
+**/target
+.cargo/
+**/axiom_cargo_home
+
+# VCS / editor / orchestrator
+.git/
+.vscode
+.DS_Store
+.claude/settings.local.json
+.claude/worktrees/
+.orchestrator/
+
+# Secrets / local env (allow .env.example so build-time defaults still work)
+.env
+.env.local
+**/.env.*
+!**/.env.example
+
+# Python tooling artifacts (scripts/dev uses a venv locally)
+.venv
+__pycache__
+**/.mypy_cache
+htmlcov*/
+.coverage
+.coverage.*
+
+# Prover/runtime artifacts (large; written at runtime, never used at build time)
+**/.prover
+**/.cache
+**/.axiom
+**/axiom-artifacts
+axiom-artifacts
+**/program.tar.gz
+**/metrics-output
+
+# Generated configs are mounted as a volume at runtime, not baked in
+**/config/generated
+
+# Test fixtures / data (not needed for cargo build)
+**/testdata
+**/test-fixtures
+**/negative_tests_worker_*
+**/benchmark_results.txt

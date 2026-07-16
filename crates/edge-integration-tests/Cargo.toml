@@ -1,0 +1,74 @@
+[package]
+name = "edge-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Integration tests for Axiom Edge services"
+
+[features]
+default = []
+# Enable mock provers for testing
+mock-provers = ["proof/mock-provers", "edge-manager/mock-provers", "edge-worker/mock-provers"]
+# Enable the stark-level deferral self-recursion e2e test. Real prover, CPU,
+# heavy; explicitly gated so default `cargo test` doesn't pull the openvm-sdk
+# `evm-prove` build into the test target.
+real-deferral-integration = [
+    "edge-worker/evm-prove",
+    "proof/evm-prove",
+    "dep:sdk-v2",
+    "dep:verify-stark",
+    "dep:openvm-verify-stark-circuit",
+    "dep:openvm-stark-backend",
+    "dep:openvm-stark-sdk",
+    "dep:openvm-sdk-config",
+    "dep:continuations-v2",
+]
+# GPU passthrough for the deferral e2e. Combine with real-deferral-integration:
+# `--features real-deferral-integration,cuda`. Uses `?/` so it only flips the
+# cuda feature on the optional sdk/continuations deps when they're already enabled
+# by real-deferral-integration (enabling `cuda` alone is a no-op build-wise).
+cuda = ["edge-worker/cuda", "sdk-v2?/cuda", "continuations-v2?/cuda"]
+
+[dependencies]
+# Local crates
+protocol = { workspace = true }
+proof = { workspace = true, default-features = false }
+
+# Optional openvm deps for the real-deferral e2e (gated on
+# `real-deferral-integration`; pulled into the test build only when enabled).
+sdk-v2 = { workspace = true, optional = true }
+verify-stark = { workspace = true, optional = true }
+openvm-verify-stark-circuit = { workspace = true, optional = true }
+openvm-stark-backend = { workspace = true, optional = true }
+openvm-stark-sdk = { workspace = true, optional = true }
+openvm-sdk-config = { workspace = true, optional = true }
+continuations-v2 = { workspace = true, optional = true }
+
+# Async
+tokio = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Error handling
+eyre = { workspace = true }
+
+# Testing utilities
+tempfile = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# Test assertions
+pretty_assertions = "1.4"
+# In-process spawn for the self-contained mock E2E test
+# (`tests/mock_e2e_test.rs`, gated on `mock-provers`).
+edge-manager = { path = "../edge-manager", default-features = false }
+edge-worker = { path = "../edge-worker", default-features = false }

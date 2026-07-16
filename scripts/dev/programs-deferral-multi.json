@@ -1,0 +1,7 @@
+[
+  {
+    "name": "verify-stark",
+    "version": 1,
+    "path": "crates/edge-integration-tests/tests/fixtures-deferral/verify-stark-multi.elf"
+  }
+]

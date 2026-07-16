@@ -1,0 +1,23 @@
+# Edge Worker Configuration - Docker Worker 3
+
+[server]
+listen_addr = "0.0.0.0:8001"
+
+[worker]
+prover_id = 3
+num_provers = 4
+# Explicit worker URL is required for Docker networking (0.0.0.0 is not routable between containers)
+worker_url = "http://edge-worker-3:8001"
+manager_url = "http://edge-manager:3000"
+
+[artifacts]
+# Base path for artifact files (unused by mock provers; defaults to /data/artifacts)
+# artifacts_path = "/data/artifacts"
+
+[provers]
+max_app_provers = 4
+max_leaf_provers = 2
+max_internal_provers = 2
+
+[telemetry]
+log_level = "info"

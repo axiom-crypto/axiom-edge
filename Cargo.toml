@@ -1,0 +1,160 @@
+[workspace]
+members = [
+    "crates/protocol",
+    "crates/proof",
+    "crates/telemetry",
+    "crates/edge-manager",
+    "crates/edge-worker",
+    "crates/edge-integration-tests",
+]
+# Standalone zkVM guest (built with `cargo openvm build`, not the host
+# toolchain) whose ELF is vendored into fixtures-deferral/. Excluded so the
+# host workspace never tries to compile it.
+exclude = ["crates/edge-integration-tests/tests/fixtures-deferral/verify-stark-multi"]
+resolver = "2"
+
+# Shared package metadata inherited by every crate via `field.workspace = true`.
+# `publish = false`: this repo is distributed as GitHub source, not via
+# crates.io (and the openvm git dependencies would block a crates.io publish
+# anyway). Dual-licensed MIT OR Apache-2.0 to match the OpenVM ecosystem.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/axiom-crypto/axiom-edge"
+authors = ["Axiom Edge Authors"]
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+protocol = { path = "crates/protocol" }
+proof = { path = "crates/proof", default-features = false }
+telemetry = { path = "crates/telemetry" }
+edge-manager = { path = "crates/edge-manager" }
+edge-worker = { path = "crates/edge-worker" }
+
+# AWS
+aws-config = "1.8.3"
+
+# Web framework
+axum = { version = "0.8.4", features = ["multipart"] }
+tower-http = { version = "0.6.6", features = ["trace", "cors"] }
+
+# Serialization
+bincode = "1.3.3"
+bitcode = "0.6.6"
+serde = { version = "1.0.198", features = ["derive"] }
+serde_json = "1.0.142"
+serde_with = "3.11.0"
+toml = "0.9.5"
+
+# Utilities
+chrono = { version = "0.4.38", features = ["serde"] }
+uuid = { version = "1.7.0", features = ["v4"] }
+eyre = "0.6.12"
+color-eyre = "0.6.5"
+thiserror = "2.0.14"
+hex = "0.4.3"
+rand = "0.8.5"
+zstd = "0.13"
+base64 = "0.22.1"
+
+# CLI
+clap = { version = "4.5.45", features = ["derive"] }
+dirs = "6.0.0"
+
+# Async runtime
+tokio = { version = "1.37.0", features = ["full"] }
+tokio-util = { version = "0.7.16", features = ["rt"] }
+async-trait = "0.1.77"
+futures = "0.3.31"
+futures-util = "0.3.30"
+
+# Concurrency
+dashmap = "6.1.0"
+crossbeam = "0.8.4"
+parking_lot = "0.12.3"
+rayon = "1.10"
+
+# HTTP client
+reqwest = { version = "0.12.23", features = ["json", "multipart"] }
+
+# Telemetry
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.31.0"
+tracing-serde = "0.2.0"
+opentelemetry = "0.30.0"
+opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.30.0"
+opentelemetry-semantic-conventions = "0.30.0"
+metrics = "0.23.0"
+metrics-util = "0.17.0"
+
+# Thread management
+thread-priority = "3.0.0"
+
+# Caching
+once_cell = "1.19"
+
+# Derive utilities
+derive_more = { version = "2.0.1", features = ["debug", "display"] }
+strum = { version = "0.27.1", features = ["derive"] }
+
+# Stark backend (must match openvm version). Pinned to the v2.0.0 tag to match
+# openvm: openvm itself pulls these crates by `tag = "v2.0.0"`, and
+# openvm-cuda-common carries a `links = "cuda-common"` key, so the whole graph
+# must share ONE stark-backend source. A differing ref here would create a
+# second source and fail to resolve ("only one package may specify the same
+# links value"), and Cargo refuses to [patch] a git source with its own repo
+# URL ("patches must point to different sources"). Keep this tag in lockstep
+# with the openvm tag below.
+openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", default-features = false, tag = "v2.0.0", features = [
+    "metrics",
+] }
+openvm-stark-backend = { git = "https://github.com/openvm-org/stark-backend.git", default-features = false, tag = "v2.0.0" }
+openvm-cuda-backend = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", default-features = false }
+openvm-cuda-common = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", default-features = false }
+
+# OpenVM, pinned to the v2.0.0 tag.
+sdk-v2 = { package = "openvm-sdk", git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0", default-features = false }
+continuations-v2 = { package = "openvm-continuations", git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0", default-features = false }
+openvm-sdk-config = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0", default-features = false }
+verify-stark = { package = "openvm-verify-stark-host", git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0", default-features = false }
+# Test-only dep for the deferral self-recursion e2e in
+# `edge-integration-tests`: `get_deferral_state` / `get_raw_deferral_results`
+# for caller-side input prep, mirroring the openvm
+# `tests::test_verify_stark_deferral` harness. Not used outside tests.
+openvm-verify-stark-circuit = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0", default-features = false }
+
+# Testing
+tempfile = "3.13.0"
+proptest = "1.5.0"
+
+[profile.dev]
+opt-level = 1
+overflow-checks = false
+panic = "unwind"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = false
+strip = true
+panic = "unwind"
+codegen-units = 16
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+debug-assertions = false
+strip = false
+
+[profile.bench]
+lto = "fat"
+
+[profile.maxperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,82 @@
+x-edge-worker-template: &edge-worker-template
+  image: axiom-edge-gpu
+  cap_add:
+    - SYS_NICE
+  shm_size: '2gb'
+  networks:
+    - edge_net
+  volumes:
+    - ${ARTIFACTS_PATH:-/tmp/edge-test-artifacts}:/data/artifacts:ro
+  profiles:
+    - gpu
+
+services:
+{% if not worker_only %}
+  edge-manager:
+    command: ["edge-manager", "--config", "/app/config/generated/manager.toml"]
+    volumes:
+      - ${ARTIFACTS_PATH:-/tmp/edge-test-artifacts}:/data/artifacts:ro
+      - ${METRICS_OUTPUT_PATH:-../metrics-output}:/data/metrics
+      - ../config/generated:/app/config/generated:ro
+      {% if persist_final_proofs_dir %}
+      - {{ persist_final_proofs_dir }}:{{ persist_final_proofs_dir }}
+      {% endif %}
+      {% if persist_leaf_failure_app_proofs_dir %}
+      - {{ persist_leaf_failure_app_proofs_dir }}:{{ persist_leaf_failure_app_proofs_dir }}
+      {% endif %}
+{% endif %}
+
+{% for w in workers %}
+  edge-worker-{{ w.index }}:
+    <<: *edge-worker-template
+    {% if not worker_only %}
+    depends_on:
+      edge-manager:
+        condition: service_healthy
+    {% endif %}
+    ports:
+      - "{{ w.http_port }}:8001"
+    {% if cpuset_enabled %}
+    cpuset: "{{ w.cpuset }}"
+    {% endif %}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['{{ w.index }}']
+              capabilities: [gpu]
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=1
+      - JEMALLOC_SYS_WITH_MALLOC_CONF={{ jemalloc }}
+      # Program loadout. Same value as the manager container; consistency
+      # is checked at /register_worker.
+      - EDGE_PROGRAMS=${EDGE_PROGRAMS:-}
+      # VPMM_* are read by openvm-cuda-common at runtime. Values come from
+      # the [cuda] section of config/templates/worker.toml.j2.
+      - VPMM_PAGE_SIZE={{ vpmm_page_size }}
+      - VPMM_PAGES={{ vpmm_pages }}
+    volumes:
+      - ${ARTIFACTS_PATH:-/tmp/edge-test-artifacts}:/data/artifacts:ro
+      - ../config/generated:/app/config/generated:ro
+      {% if halo2_pk_path %}
+      # Halo2 proving key + SRS (>10GB). Host dir is the value passed to
+      # `--halo2-pk-path`; container-side path matches `[artifacts] halo2_pk_path`
+      # rendered into worker-<i>.toml.
+      - ${HALO2_PK_PATH}:/data/halo2_pk:ro
+      {% endif %}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    command: ["edge-worker", "--config", "/app/config/generated/worker-{{ w.index }}.toml"]
+
+{% endfor %}
+{% if worker_only %}
+networks:
+  edge_net:
+    driver: bridge
+{% endif %}

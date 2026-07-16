@@ -1,0 +1,138 @@
+[package]
+name = "edge-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Axiom Edge worker: runs app/leaf/internal OpenVM provers"
+
+[[bin]]
+name = "edge-worker"
+path = "src/main.rs"
+
+[[bin]]
+name = "convert_fixtures"
+path = "src/bin/convert_fixtures.rs"
+# This binary requires real prover dependencies (not mock-provers)
+
+[[bin]]
+name = "keygen"
+path = "src/bin/keygen.rs"
+
+[[bin]]
+name = "halo2-keygen"
+path = "src/bin/halo2_keygen.rs"
+# `main` is gated on `evm-prove` (halo2 keygen is only meaningful there), so
+# cargo must skip this bin unless the feature is on — otherwise default/
+# mock-provers `--all-targets` builds fail with "main not found".
+required-features = ["evm-prove"]
+
+[[bin]]
+name = "verify_edge_final_proof"
+path = "src/bin/verify_edge_final_proof.rs"
+
+[[bin]]
+name = "generate_edge_vm_vk"
+path = "src/bin/generate_edge_vm_vk.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+# Enable mock provers for testing (disables real prover code)
+mock-provers = ["proof/mock-provers"]
+# Enable the EVM (halo2) tail: root/halo2 provers, keygen bins, and artifact
+# loading. CPU-capable, orthogonal to cuda.
+evm-prove = [
+    "proof/evm-prove",
+    "sdk-v2/evm-prove",
+    "sdk-v2/root-prover",
+    "continuations-v2/root-prover",
+]
+# Enable CUDA for GPU proving. Uses `sdk-v2/halo2-gpu` (a superset of
+# `sdk-v2/cuda`) so the halo2 EVM-wrap prover also runs on GPU — matching the
+# STARK provers. Without `evm-prove`, `halo2-gpu` is inert (reduces to `cuda`),
+# since its GPU-halo2 arm is `openvm-static-verifier?/halo2-gpu` and the
+# static verifier is only pulled in by `evm-prove`.
+cuda = ["sdk-v2/halo2-gpu", "continuations-v2/cuda", "dep:openvm-cuda-common", "dep:openvm-cuda-backend"]
+# Performance features
+jemalloc = ["sdk-v2/jemalloc", "tikv-jemalloc-ctl"]
+parallel = ["sdk-v2/parallel"]
+# aot toggles the openvm-sdk backend path
+aot = ["sdk-v2/aot"]
+tco = ["sdk-v2/tco"]            # mutually exclusive with aot
+unprotected = ["sdk-v2/unprotected"]  # requires nightly
+
+[dependencies]
+# Internal crates
+protocol = { workspace = true }
+proof = { workspace = true, default-features = false }
+telemetry = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+tower-http = { workspace = true }
+
+# Serialization
+bincode = { workspace = true }
+bitcode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+uuid = { workspace = true }
+eyre = { workspace = true }
+color-eyre = { workspace = true }
+hex = { workspace = true }
+zstd = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+
+# Concurrency
+dashmap = { workspace = true }
+crossbeam = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Telemetry
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+metrics = { workspace = true }
+
+# Thread management
+thread-priority = { workspace = true }
+
+# Caching
+once_cell = { workspace = true }
+
+# Memory allocator (optional, enabled via jemalloc feature)
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
+
+# OpenVM proving (always needed for real provers, which is the default)
+sdk-v2 = { workspace = true }
+continuations-v2 = { workspace = true }
+openvm-sdk-config = { workspace = true }
+openvm-stark-backend = { workspace = true }
+openvm-stark-sdk = { workspace = true }
+openvm-cuda-common = { workspace = true, optional = true }
+openvm-cuda-backend = { workspace = true, optional = true }
+verify-stark = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,40 @@
+# Edge Worker Configuration
+# This file configures the proof generation worker (edge-worker)
+
+[server]
+# HTTP listen address for work requests
+listen_addr = "0.0.0.0:8001"
+
+[worker]
+# Worker ID (0-indexed, must be unique per worker in the pool)
+prover_id = 0
+# Total number of workers in the pool
+num_provers = 4
+# This worker's URL for manager registration (optional, derived from listen_addr if not set)
+# worker_url = "http://worker-0:8001"
+# Manager URL for registration and result submission
+manager_url = "http://localhost:3000"
+
+[artifacts]
+# Base path for artifact files (optional, defaults to /data/artifacts). Layout:
+#   {artifacts_path}/app_pk, {artifacts_path}/agg_stark_pk,
+#   {artifacts_path}/programs/{name}/{version}/program.vmexe
+# artifacts_path = "/data/artifacts"
+
+[provers]
+# Number of concurrent OfflineAppProver threads
+max_app_provers = 4
+# Number of concurrent LeafProver threads
+max_leaf_provers = 2
+# Number of concurrent InternalProver threads
+max_internal_provers = 1
+# Default VM segmentation override applied when a prove request does not
+# set segment_memory. When absent, the VM's built-in default applies.
+# Pin this to make segmentation reproducible per deployment.
+# default_segment_memory = 1073741824
+
+[telemetry]
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+# OpenTelemetry collector endpoint (optional, comment out to disable)
+# otlp_endpoint = "http://localhost:4317"

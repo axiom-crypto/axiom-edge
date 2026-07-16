@@ -1,0 +1,93 @@
+# Default config values used by scripts/dev/start-provers.py to render
+# config/generated/manager.toml and config/generated/worker-N.toml.
+#
+# This file is the single source of truth for tunable defaults. Override
+# individual values at deploy time via start-provers.py CLI flags. Secrets
+# (API keys) are passed via env vars at deploy time, not stored here.
+#
+# Sections mirror the rendered TOMLs. Keys that appear in both manager.toml
+# and worker.toml (e.g. [provers]) are listed once here and used by both.
+
+[server]
+# Manager binds on this address (rendered into manager.toml).
+manager_listen_addr = "0.0.0.0:3000"
+# Worker binds on this address (rendered into worker.toml).
+worker_listen_addr = "0.0.0.0:8001"
+
+[provers]
+# Used by both manager and worker; manager validates worker registrations
+# match these values. Override via --app-provers / --leaf-provers /
+# --internal-provers.
+max_app_provers = 2
+max_leaf_provers = 2
+max_internal_provers = 1
+# Optional VM segmentation override (worker only). Unset = OpenVM picks its
+# own default. Uncomment or override via --segment-memory.
+# default_segment_memory = 268435456
+
+[proof]
+# Manager-side proof scheduling knobs.
+leaf_pack_threshold = 1000
+# Watchdog wall-clock deadline per proof. The watchdog ticks every 30s and
+# marks any proof exceeding this as Failed("timeout: ..."), freeing its
+# scheduler slot. Override per-request via StartProofRequest.timeout_secs.
+timeout_secs = 300
+# Recursion-tree fan-ins. Both bounded by SDK's MAX_NUM_CHILDREN_*
+# constants. Override via --leaf-arity / --internal-arity.
+leaf_arity = 4
+internal_arity = 3
+
+[cuda]
+# Worker-side CUDA VPMM tuning. start-provers reads these and passes them
+# to the worker container as env vars (openvm-cuda-common reads them at GPU
+# allocator init). Override via --vpmm-page-size / --vpmm-pages.
+vpmm_page_size = 16777216
+vpmm_pages = 0
+
+[metrics]
+# Manager-side metrics export. Override via --metrics-endpoint /
+# --metrics-output-dir.
+output_dir = "/data/metrics"
+endpoint = "http://host.docker.internal:4318/v1/metrics"
+
+[telemetry]
+log_level = "info"
+
+[paths]
+# Host directory holding shared proving keys + per-program vmexes.
+# start-provers writes generated artifacts here AND injects it into the
+# docker compose environment as ARTIFACTS_PATH, which the compose volume
+# mounts interpolate (`${ARTIFACTS_PATH}`). Keep this as the single source
+# so the host-side keygen path and the container mount path never diverge.
+artifacts_path = "/tmp/edge-test-artifacts"
+# Host directory holding the halo2 proving key + SRS files (>10GB,
+# produced by the offline `halo2-keygen` binary). Has no defaults-file
+# entry on purpose — pass via `--halo2-pk-path` at deploy time when
+# proof_type=evm is needed; stark-only deployments leave it unset and
+# the worker boots without the EVM artifacts. start-provers exports
+# this as HALO2_PK_PATH for the compose `${HALO2_PK_PATH}:/data/halo2_pk:ro`
+# mount and renders `[artifacts] halo2_pk_path = "/data/halo2_pk"` into
+# the worker TOML when the flag is present.
+# Host directory mounted into the manager container at /data/metrics.
+# Injected as METRICS_OUTPUT_PATH for the compose volume mount
+# (`${METRICS_OUTPUT_PATH}`). Relative paths resolve from docker/.
+metrics_output_path = "../metrics-output"
+
+[build]
+# Docker image build + cargo build knobs. start-provers reads these to build
+# the axiom-edge-gpu image and to drive host-side keygen. Override the
+# feature/toolchain/cuda-arch ones via --features / --toolchain / --cuda-arch.
+# The rest have no CLI flag yet — edit here if you need to change them.
+#
+# NOTE: this file is the single source of truth. start-provers does NOT read
+# any of these from environment variables (secrets like METRICS_API_KEY are
+# the only env-var inputs).
+features = "cuda,jemalloc,parallel,aot,unprotected"
+toolchain = "+1.91.1"
+cuda_arch = "120"
+jemalloc = "retain:true,background_thread:true,metadata_thp:always,dirty_decay_ms:10000,muzzy_decay_ms:10000,abort_conf:true"
+cargo_build_jobs = "32"
+profile = "release"
+target_cpu = "native"
+builder_image = "nvidia/cuda:13.1.0-devel-ubuntu24.04"
+runtime_image = "nvidia/cuda:13.1.0-runtime-ubuntu24.04"

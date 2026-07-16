@@ -1,0 +1,56 @@
+# Edge Manager Configuration
+# This file configures the proof orchestration service (edge-manager)
+
+[server]
+# HTTP listen address for API endpoints
+listen_addr = "0.0.0.0:3000"
+# Total number of workers expected in the proving stack.
+# /readyz and start_proof gate on full registration against this count.
+num_workers = 4
+
+[provers]
+# Per-worker capacity expected by every worker in the stack.
+# These values must match each worker's [provers] section
+# (templated together by scripts/dev/start-provers.py).
+# Workers report their actual capacity at registration; manager rejects drift.
+max_app_provers = 2
+max_leaf_provers = 2
+max_internal_provers = 1
+
+[proof]
+# Leaf packing threshold - minimum app proofs before creating a leaf proof
+leaf_pack_threshold = 4
+# Maximum proof execution time before timeout (in seconds)
+timeout_secs = 3600
+# Recursion-tree fan-ins: app→leaf and child→internal arities.
+leaf_arity = 4
+internal_arity = 3
+# Optional directory to persist completed final proofs as bincode
+# persist_final_proofs_dir = "/tmp/edge-final-proofs"
+# When persisting final proofs, optionally zstd-compress the payload before writing
+# compress_persisted_final_proofs = true
+# Optional directory to snapshot app proofs when leaf proving fails with
+# LogupZerocheck nonzero-root-sum
+# persist_leaf_failure_app_proofs_dir = "/tmp/edge-leaf-failure-app-proofs"
+
+[metrics]
+# Directory where per-proof metrics reports (.md) are written on completion.
+output_dir = "/data/metrics"
+# OTLP HTTP endpoint for metrics export. Omit to disable export.
+# endpoint = "http://metrics-api:8080/v1/metrics"
+# API key sent as X-API-Key header on metrics uploads.
+# api_key = "secret"
+
+[lifecycle]
+# Optional generic proof-lifecycle webhook. When set, the manager POSTs
+# queued/proving/completed events (with opaque `labels`) here for an external
+# consumer to translate (e.g. a reporter sidecar). The edge itself
+# is destination-agnostic.
+# webhook_url = "http://host.docker.internal:9110/events"
+# timeout_ms = 6000
+
+[telemetry]
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+# OpenTelemetry collector endpoint (optional, comment out to disable)
+# otlp_endpoint = "http://localhost:4317"

@@ -1,0 +1,60 @@
+[server]
+listen_addr = "{{ worker_listen_addr }}"
+
+[worker]
+prover_id = {{ prover_id }}
+num_provers = {{ num_provers }}
+worker_url = "{{ worker_url }}"
+manager_url = "{{ manager_url }}"
+{% if worker_role %}
+# Deployment role. Omitted by default ⇒ serde default `Full` (today's
+# behavior). Set only in `--dedicated-halo2-gpu` mode: the highest-id worker
+# is `evm_dedicated` (root + halo2 only), the rest `normal` (app + leaf +
+# internal, no root/halo2). Serde form is snake_case.
+worker_role = "{{ worker_role }}"
+{% endif %}
+
+[artifacts]
+# Base path for proving artifacts on disk:
+#   {artifacts_path}/app_pk                              (shared)
+#   {artifacts_path}/agg_stark_pk                        (shared)
+#   {artifacts_path}/root_pk                             (shared, evm-prove only)
+#   {artifacts_path}/programs/{name}/{version}/program.vmexe   (per-ELF)
+# The program loadout itself comes from the EDGE_PROGRAMS env, set on
+# every container by start-provers.
+artifacts_path = "/data/artifacts"
+{% if halo2_pk_path %}
+# Dir containing the halo2 proving key + SRS files (verifier/wrapper).
+# Mounted read-only from the host dir passed via `--halo2-pk-path`. Only
+# rendered when that flag was passed at deploy time; stark-only deploys
+# leave it unset so the worker boots without trying to load >10GB.
+halo2_pk_path = "{{ halo2_pk_path }}"
+{% endif %}
+{% if enable_deferral %}
+# Enable deferral mode (verify-stark / proof-of-proof). The worker loads the
+# deferral-aware `SdkCachedProvingKey` from the conventional location
+# `<artifacts_path>/deferral/cached_pk` (produced by `keygen --with-deferral`,
+# sitting alongside the other shared keys — so the location is derived, not a
+# separate path like halo2_pk). This worker then reconstructs a deferral-enabled
+# SDK at boot and becomes the tail-merge-capable node: every proof on this
+# deployment runs through the deferral keyset (single keyset per deployment). Only rendered when `--with-deferral` was passed.
+enable_deferral = true
+{% endif %}
+
+[provers]
+max_app_provers = {{ max_app_provers }}
+max_leaf_provers = {{ max_leaf_provers }}
+max_internal_provers = {{ max_internal_provers }}
+{% if default_segment_memory %}
+default_segment_memory = {{ default_segment_memory }}
+{% endif %}
+
+# CUDA runtime tuning. Read by start-provers (not by the Rust worker) and
+# exported as VPMM_PAGE_SIZE / VPMM_PAGES to the worker container, where the
+# openvm-cuda-common dependency reads them at GPU-allocator init time.
+[cuda]
+vpmm_page_size = {{ vpmm_page_size }}
+vpmm_pages = {{ vpmm_pages }}
+
+[telemetry]
+log_level = "{{ log_level }}"

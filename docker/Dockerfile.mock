@@ -1,0 +1,42 @@
+# Dockerfile for mock-provers build (no CUDA/GPU needed)
+# Used for local testing of the metrics pipeline.
+
+FROM rust:1.91.1-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake clang pkg-config libssl-dev protobuf-compiler git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ensure github.com is a known host
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+WORKDIR /app
+COPY . .
+
+RUN cargo build --release --features mock-provers -p edge-manager \
+    && cargo build --release --features mock-provers -p edge-worker --bin edge-worker
+
+# Runtime
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl libssl3 ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/edge-manager .
+COPY --from=builder /app/target/release/edge-worker .
+COPY config/ ./config/
+
+# Create a dummy input for mock proving
+RUN mkdir -p /dev/shm && echo "mock-input" > /tmp/mock-input.bin
+
+COPY docker/docker-entrypoint.sh ./docker-entrypoint.sh
+RUN chmod +x docker-entrypoint.sh
+
+ENV RUST_BACKTRACE=full
+
+ENTRYPOINT ["./docker-entrypoint.sh"]
+CMD ["edge-worker"]

@@ -1,0 +1,44 @@
+# Edge Manager Configuration for Docker deployment
+
+[server]
+listen_addr = "0.0.0.0:3000"
+# Total number of workers expected in the proving stack (the mock compose
+# starts edge-worker-0..3). /readyz and start_proof gate on full registration.
+num_workers = 4
+
+[provers]
+# Per-worker capacity expected by every worker in the stack. Must match each
+# docker-worker-*.toml [provers] section — workers report their capacity at
+# registration and the manager rejects drift.
+max_app_provers = 4
+max_leaf_provers = 2
+max_internal_provers = 2
+
+[proof]
+leaf_pack_threshold = 4
+timeout_secs = 3600
+leaf_arity = 4
+internal_arity = 3
+# Optional directory to persist completed final proofs as bincode
+# persist_final_proofs_dir = "/tmp/edge-final-proofs"
+# When persisting final proofs, optionally zstd-compress the payload before writing
+# compress_persisted_final_proofs = true
+# Optional directory to snapshot app proofs when leaf proving fails with
+# LogupZerocheck nonzero-root-sum
+# persist_leaf_failure_app_proofs_dir = "/tmp/edge-leaf-failure-app-proofs"
+
+[metrics]
+output_dir = "/data/metrics"
+# endpoint = "http://metrics-api:8080/v1/metrics"
+# api_key = "secret"
+
+[lifecycle]
+# Optional generic proof-lifecycle webhook. When set, the manager POSTs
+# queued/proving/completed events (with opaque `labels`) here for an external
+# consumer to translate (e.g. a reporter sidecar). The edge itself
+# is destination-agnostic.
+# webhook_url = "http://host.docker.internal:9110/events"
+# timeout_ms = 6000
+
+[telemetry]
+log_level = "info"

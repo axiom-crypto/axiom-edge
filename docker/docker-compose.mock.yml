@@ -1,0 +1,93 @@
+# Axiom Edge Docker Compose: Mock provers for local testing
+# Usage: docker compose -f docker/docker-compose.mock.yml up --build
+#
+# EDGE_PROGRAMS is the program loadout both the manager and every worker
+# parse at boot (they must agree, so it's pinned identically on all
+# services). Mock provers never load real artifacts, so the placeholder
+# `mock-program@1` works out of the box; edit the value on every service
+# at once if you want different names.
+
+services:
+  edge-build-mock:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mock
+    image: axiom-edge-mock
+    command: ["/bin/true"]
+
+  edge-manager:
+    image: axiom-edge-mock
+    depends_on:
+      edge-build-mock:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=1
+      - 'EDGE_PROGRAMS=[{"name":"mock-program","version":1}]'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    command: ["edge-manager", "--config", "/app/config/testing/docker-manager.toml"]
+    networks:
+      - edge_net
+
+  edge-worker-0:
+    image: axiom-edge-mock
+    depends_on:
+      edge-manager:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=1
+      - 'EDGE_PROGRAMS=[{"name":"mock-program","version":1}]'
+    command: ["edge-worker", "--config", "/app/config/testing/docker-worker-0.toml"]
+    networks:
+      - edge_net
+
+  edge-worker-1:
+    image: axiom-edge-mock
+    depends_on:
+      edge-manager:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=1
+      - 'EDGE_PROGRAMS=[{"name":"mock-program","version":1}]'
+    command: ["edge-worker", "--config", "/app/config/testing/docker-worker-1.toml"]
+    networks:
+      - edge_net
+
+  edge-worker-2:
+    image: axiom-edge-mock
+    depends_on:
+      edge-manager:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=1
+      - 'EDGE_PROGRAMS=[{"name":"mock-program","version":1}]'
+    command: ["edge-worker", "--config", "/app/config/testing/docker-worker-2.toml"]
+    networks:
+      - edge_net
+
+  edge-worker-3:
+    image: axiom-edge-mock
+    depends_on:
+      edge-manager:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=1
+      - 'EDGE_PROGRAMS=[{"name":"mock-program","version":1}]'
+    command: ["edge-worker", "--config", "/app/config/testing/docker-worker-3.toml"]
+    networks:
+      - edge_net
+
+networks:
+  edge_net:
+    driver: bridge

@@ -1,0 +1,25 @@
+# Standalone zkVM guest: verify-stark that makes a configurable number of
+# `verify_stark` calls against one deferral circuit (`num_verifies`, read at
+# runtime). 
+#
+# Build (produces an ELF; edge transpiles it to a vmexe at deploy time):
+#   cargo openvm build --no-transpile --output-dir out
+# then vendor the ELF (target/riscv32im-risc0-zkvm-elf/release/verify-stark-multi)
+# into ../verify-stark-multi.elf
+[package]
+name = "verify-stark-multi"
+version = "0.0.0"
+edition = "2021"
+
+# Own workspace root so the host workspace never absorbs it.
+[workspace]
+members = []
+
+[dependencies]
+openvm = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0", default-features = false }
+openvm-deferral-guest = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0", default-features = false }
+openvm-verify-stark-guest = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0", default-features = false }
+
+[profile.release]
+panic = "abort"
+lto = "thin"
