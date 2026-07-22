@@ -28,7 +28,25 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     openssh-client \
     pkg-config \
     libssl-dev \
-    ca-certificates
+    ca-certificates \
+    wget \
+    lsb-release \
+    gnupg \
+    software-properties-common
+
+# The rvr execution backend (openvm develop-v2.1.0, successor to the removed
+# `aot` backend) compiles native FFI (blst / secp256k1 / keccak) with clang and
+# requires clang >= 19. Ubuntu 24.04's `clang` package is clang-18, so install a
+# newer clang from apt.llvm.org and point RVR_CC at it. Bump CLANG_VERSION in
+# lockstep with the clang used on production/dev hosts.
+ARG CLANG_VERSION=21
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+    && chmod +x /tmp/llvm.sh \
+    && /tmp/llvm.sh ${CLANG_VERSION} \
+    && rm -f /tmp/llvm.sh
+ENV RVR_CC=clang-${CLANG_VERSION}
 
 # Install Rust, only if not already present in the base image
 RUN if ! command -v rustc >/dev/null 2>&1; then \
@@ -145,7 +163,39 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     tini \
     gcc \
     binutils \
-    libc6-dev
+    libc6-dev \
+    make \
+    wget \
+    lsb-release \
+    gnupg \
+    software-properties-common
+
+# The `rvr` execution backend compiles each guest program to a native shared
+# library AT WORKER BOOT (AppExecutionInstances::new), so the *runtime* image —
+# not just the builder — needs clang (>= 19), lld, and make. Ubuntu 24.04 ships
+# clang-18, so install a newer clang+lld from apt.llvm.org and point RVR_CC /
+# RVR_LD at them (openvm otherwise probes for a bare `clang` / `lld`, which the
+# versioned packages don't provide). Must be clang-22 here: the rvr guest→native
+# codegen (openvm develop-v2.1.0) is compiled with `-Werror,-Wsign-conversion`
+# and only builds clean on clang-22 (its `DEFAULT_CLANG_COMMAND`); clang-21
+# errors out. The builder stage's FFI static libs compile fine on clang-21, so
+# only this runtime stage needs to be bumped.
+ARG CLANG_VERSION=22
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+    && chmod +x /tmp/llvm.sh \
+    && /tmp/llvm.sh ${CLANG_VERSION} \
+    && apt-get install -y --no-install-recommends lld-${CLANG_VERSION} \
+    && rm -f /tmp/llvm.sh \
+    # openvm's linker pre-check probes for a bare `lld`/`ld.lld`, and clang's
+    # `-fuse-ld=` rejects a versioned name (`-fuse-ld=ld.lld-21` is invalid) —
+    # it only accepts `lld` or an absolute path. Provide unversioned symlinks so
+    # RVR_LD=lld satisfies both the pre-check and `-fuse-ld=lld`.
+    && ln -sf /usr/bin/lld-${CLANG_VERSION} /usr/bin/lld \
+    && ln -sf /usr/bin/ld.lld-${CLANG_VERSION} /usr/bin/ld.lld
+ENV RVR_CC=clang-${CLANG_VERSION}
+ENV RVR_LD=lld
 
 WORKDIR /app
 

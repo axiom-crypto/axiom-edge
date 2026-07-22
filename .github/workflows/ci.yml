@@ -96,30 +96,41 @@ jobs:
           fi
 
   # Compile-only coverage for the production feature set
-  # (config/defaults.toml: features = "cuda,jemalloc,parallel,aot,unprotected").
+  # (config/defaults.toml: features = "cuda,jemalloc,parallel,rvr,unprotected").
   # The default/mock-provers jobs above never type-check these paths, so prod
   # code can rot silently. These jobs build but do not run (no GPU needed).
   #
   # Toolchain is 1.91.1 (rust-toolchain.toml). The openvm git deps require
   # rustc >= 1.91.1, so an older toolchain fails to resolve; `unprotected`
   # compiles fine on stable despite its historical "requires nightly" note.
+  #
+  # `rvr` (successor to the removed `aot` backend) compiles native FFI with
+  # clang (>= 19); ubuntu-latest ships clang-18, so install a newer clang from
+  # apt.llvm.org and point RVR_CC at it.
   prod-features-cpu:
     name: check prod CPU features (compile-only)
     runs-on: ubuntu-latest
+    env:
+      RVR_CC: clang-19
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.1
+      - name: Install clang for rvr
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: prod-features-cpu
-      - name: cargo check (jemalloc, parallel, aot, unprotected)
-        run: cargo check -p edge-worker --features jemalloc,parallel,aot,unprotected
+      - name: cargo check (jemalloc, parallel, rvr, unprotected)
+        run: cargo check -p edge-worker --features jemalloc,parallel,rvr,unprotected
       # `evm-prove` gates a large body of code the default/mock-provers jobs
       # never compile: the real Halo2Prover/RootProver, `run_evm_prove`, and the
       # `halo2-keygen` bin (whose `main` is evm-prove-only). Compile it here so
       # the EVM path can't rot silently. CPU-only — halo2 needs no GPU.
       - name: cargo check (+ evm-prove)
-        run: cargo check -p edge-worker --features jemalloc,parallel,aot,unprotected,evm-prove
+        run: cargo check -p edge-worker --features jemalloc,parallel,rvr,unprotected,evm-prove
 
   # License + advisory + source gate. Configuration lives in deny.toml at the
   # repo root; see the file header for the license curation rationale and the
@@ -163,6 +174,8 @@ jobs:
       # Ada (L40S), 120 = Blackwell. Keep this list in sync with the arch(s)
       # produced for production (config/defaults.toml cuda_arch).
       CUDA_ARCH: "89,120"
+      # rvr native FFI is compiled with clang; installed below from apt.llvm.org.
+      RVR_CC: clang-19
     steps:
       - uses: actions/checkout@v4
       # The container is bare (no rustup/git/cc). checkout falls back to the
@@ -171,7 +184,12 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            curl ca-certificates git build-essential pkg-config libssl-dev
+            curl ca-certificates git build-essential pkg-config libssl-dev \
+            wget lsb-release gnupg software-properties-common
+          # rvr native FFI needs clang >= 19 (Ubuntu 24.04 ships clang-18).
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          /tmp/llvm.sh 19
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain 1.91.1 --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -179,4 +197,4 @@ jobs:
         with:
           shared-key: prod-features-cuda
       - name: cargo check (full production feature set)
-        run: cargo check -p edge-worker --features cuda,jemalloc,parallel,aot,unprotected
+        run: cargo check -p edge-worker --features cuda,jemalloc,parallel,rvr,unprotected

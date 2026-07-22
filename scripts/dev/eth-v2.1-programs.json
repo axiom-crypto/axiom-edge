@@ -1,0 +1,7 @@
+[
+  {
+    "name": "openvm-eth",
+    "version": 1,
+    "path": "~/cloud-proving-backend/artifacts/elf/openvm-client-eth-2.1.0-0721.elf"
+  }
+]

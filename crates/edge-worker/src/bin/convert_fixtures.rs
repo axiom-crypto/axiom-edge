@@ -253,7 +253,7 @@ mod converter {
         println!("  Found {} input elements", input_array.len());
 
         // Create StdIn and add each input
-        let mut stdin = StdIn::<F>::default();
+        let mut stdin = StdIn::default();
 
         for (i, item) in input_array.iter().enumerate() {
             let hex_str = item
@@ -482,7 +482,7 @@ mod converter {
         // Read input file (bincode-serialized StdIn)
         let input_bytes = std::fs::read(input_path)
             .wrap_err_with(|| format!("Failed to read input file: {}", input_path.display()))?;
-        let stdin: StdIn<F> = bincode::deserialize(&input_bytes)
+        let stdin: StdIn = bincode::deserialize(&input_bytes)
             .wrap_err("Failed to deserialize StdIn from bincode")?;
         println!("  Input deserialized successfully");
 
@@ -557,7 +557,7 @@ mod converter {
         // Read input file (bincode-serialized StdIn)
         let input_bytes = std::fs::read(input_path)
             .wrap_err_with(|| format!("Failed to read input file: {}", input_path.display()))?;
-        let stdin: StdIn<F> = bincode::deserialize(&input_bytes)
+        let stdin: StdIn = bincode::deserialize(&input_bytes)
             .wrap_err("Failed to deserialize StdIn from bincode")?;
         println!("  Input deserialized successfully");
 

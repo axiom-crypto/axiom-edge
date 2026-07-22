@@ -261,10 +261,16 @@ mod real_impl {
         deferral::DeferralState,
         execution_mode::{ExecutionCtx, MeteredCtx, Segment},
         hasher::poseidon2::vm_poseidon2_hasher,
-        SystemConfig, VmExecState, VmExecutor, VmInstance, VmState,
+        SystemConfig, VmExecutor, VmInstance, VmState,
     };
+    // `VmExecState` drives the interpreter metered loop; under rvr the metered
+    // loop threads `(VmState, MeteredCtx)` by value instead, so it's unused.
+    #[cfg(not(feature = "rvr"))]
+    use sdk_v2::openvm_circuit::arch::VmExecState;
     use sdk_v2::openvm_circuit::system::memory::merkle::public_values::UserPublicValuesProof;
-    use sdk_v2::openvm_circuit::system::memory::{dimensions::MemoryDimensions, AddressMap};
+    use sdk_v2::openvm_circuit::system::memory::{
+        dimensions::MemoryDimensions, online::GuestMemory, AddressMap,
+    };
     use sdk_v2::prover::vm::new_local_prover;
     use sdk_v2::StdIn;
     use std::collections::VecDeque;
@@ -422,8 +428,8 @@ mod real_impl {
     fn build_execution_stdin(
         input_bytes: &[u8],
         deferral_state_paths: &[String],
-    ) -> Result<StdIn<proof::F>> {
-        let mut stdin: StdIn<proof::F> = bincode::deserialize(input_bytes)
+    ) -> Result<StdIn> {
+        let mut stdin: StdIn = bincode::deserialize(input_bytes)
             .map_err(|e| eyre::eyre!("Failed to deserialize input: {}", e))?;
         let deferrals = load_and_validate_deferral_states(deferral_state_paths)?;
         if !deferrals.is_empty() {
@@ -450,15 +456,206 @@ mod real_impl {
     /// Type alias for the prover instance type returned by new_local_prover
     pub type ProverType = VmInstance<RecursionEngine, SdkVmBuilder>;
 
-    /// Type alias for the execution instance type.
-    #[cfg(not(feature = "aot"))]
-    type ExecutionInstanceType<Ctx> =
-        sdk_v2::openvm_circuit::arch::InterpretedInstance<'static, proof::F, Ctx>;
+    // Execution instance types for segment discovery (metered) and
+    // fast-forwarding to a segment start (pure).
+    //
+    // Default backend: openvm's `InterpretedInstance` (v2.1.0 dropped its field
+    // type parameter — it is now generic only over the execution `Ctx`).
+    //
+    // Pure (fast-forward) instance: ALWAYS the interpreter, both backends.
+    // The fast-forward must land EXACTLY at a segment's `instret_start` before
+    // proving. The interpreter is instruction-exact; rvr's pure
+    // `execute_from_state_for` only stops at a basic-block boundary (it may
+    // over/undershoot `num_insns`), which lands the segment at the wrong start
+    // state and makes its trace fail the LogUp argument. So we keep the exact
+    // interpreter for fast-forward (a cheap ~1-segment replay) and use the
+    // native rvr backend only for the expensive metered segment discovery.
+    type PureInstanceType = sdk_v2::openvm_circuit::arch::InterpretedInstance<'static, ExecutionCtx>;
 
-    /// Type alias for the execution instance type.
-    #[cfg(feature = "aot")]
-    type ExecutionInstanceType<Ctx> =
-        sdk_v2::openvm_circuit::arch::AotInstance<'static, proof::F, Ctx>;
+    // Metered (segment discovery) instance: interpreter by default; the native
+    // rvr segment-boundary instance under `rvr` (the successor to the removed
+    // `aot` backend). The `MeteredDriver` below abstracts the two APIs so the
+    // pipelined executor loop is written once.
+    #[cfg(not(feature = "rvr"))]
+    type MeteredInstanceType =
+        sdk_v2::openvm_circuit::arch::InterpretedInstance<'static, MeteredCtx>;
+    #[cfg(feature = "rvr")]
+    type MeteredInstanceType = sdk_v2::openvm_circuit::arch::rvr::RvrMeteredSegmentInstance<'static>;
+
+    /// Fast-forward `vm_state` by exactly `num_ins` instructions on the pure
+    /// (interpreter) instance, returning the resulting VM state. Instruction-
+    /// exact: it lands precisely at the segment's `instret_start`.
+    fn fast_forward(
+        pure: &PureInstanceType,
+        vm_state: VmState<GuestMemory>,
+        num_ins: u64,
+    ) -> std::result::Result<VmState<GuestMemory>, sdk_v2::openvm_circuit::arch::ExecutionError>
+    {
+        Ok(pure.execute_from_state_for(vm_state, num_ins)?.into_inner())
+    }
+
+    /// Backend-abstracted driver for the pipelined metered segmentation loop.
+    ///
+    /// Both backends discover the same `Segment`s and expose the same
+    /// per-boundary data (segments so far, `instret`, and the VM state at the
+    /// boundary). They differ only in how one "run until the next segment
+    /// boundary" step is driven: the interpreter threads a single `VmExecState`;
+    /// the rvr backend threads `(VmState, MeteredCtx)` by value and returns a
+    /// `SegmentationState`. Writing the loop against this driver keeps the
+    /// snapshot / `+2`-lookahead / dispatch logic identical across both.
+    struct MeteredDriver<'a> {
+        instance: &'a MeteredInstanceType,
+        #[cfg(not(feature = "rvr"))]
+        exec_state: Option<VmExecState<GuestMemory, MeteredCtx>>,
+        #[cfg(feature = "rvr")]
+        vm_state: Option<VmState<GuestMemory>>,
+        #[cfg(feature = "rvr")]
+        ctx: Option<MeteredCtx>,
+    }
+
+    impl<'a> MeteredDriver<'a> {
+        fn new(
+            instance: &'a MeteredInstanceType,
+            vm_state: VmState<GuestMemory>,
+            metered_ctx: MeteredCtx,
+        ) -> Self {
+            #[cfg(not(feature = "rvr"))]
+            {
+                Self {
+                    instance,
+                    exec_state: Some(VmExecState::new(vm_state, metered_ctx)),
+                }
+            }
+            #[cfg(feature = "rvr")]
+            {
+                Self {
+                    instance,
+                    vm_state: Some(vm_state),
+                    ctx: Some(metered_ctx),
+                }
+            }
+        }
+
+        /// Advance to the next segment boundary. Returns `true` iff the program
+        /// terminated (i.e. the just-closed segment is the final one). A
+        /// non-zero guest exit is an error on both backends.
+        fn step(&mut self) -> Result<bool> {
+            #[cfg(not(feature = "rvr"))]
+            {
+                let es = self
+                    .exec_state
+                    .take()
+                    .expect("exec_state present between steps");
+                let mut es = self.instance.execute_metered_until_suspend(es)?;
+                let mut exit_code = Ok(None);
+                std::mem::swap(&mut exit_code, &mut es.exit_code);
+                let exit_code = exit_code?;
+                let terminated = match exit_code {
+                    Some(code) if code != 0 => {
+                        return Err(eyre::eyre!("VM exited with non-zero exit code: {}", code));
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
+                self.exec_state = Some(es);
+                Ok(terminated)
+            }
+            #[cfg(feature = "rvr")]
+            {
+                let vm_state = self.vm_state.take().expect("vm_state present between steps");
+                let ctx = self.ctx.take().expect("ctx present between steps");
+                // A non-zero guest exit surfaces here as an `Err` (rvr
+                // `GuestExit`), matching the interpreter's explicit non-zero
+                // check above.
+                let (outcome, vm_state) = self
+                    .instance
+                    .execute_metered_from_state_until_segment_boundary(vm_state, ctx)?;
+                let (seg_state, terminated) = match outcome {
+                    sdk_v2::openvm_circuit::arch::ExecutionOutcome::Terminated(s) => (s, true),
+                    sdk_v2::openvm_circuit::arch::ExecutionOutcome::Suspended(s) => (s, false),
+                };
+                self.vm_state = Some(vm_state);
+                self.ctx = Some(seg_state.ctx);
+                Ok(terminated)
+            }
+        }
+
+        /// Segments discovered so far (the last entry is the just-closed one).
+        fn segments(&self) -> &[Segment] {
+            #[cfg(not(feature = "rvr"))]
+            {
+                &self
+                    .exec_state
+                    .as_ref()
+                    .expect("exec_state present")
+                    .ctx
+                    .segmentation_ctx
+                    .segments
+            }
+            #[cfg(feature = "rvr")]
+            {
+                &self
+                    .ctx
+                    .as_ref()
+                    .expect("ctx present")
+                    .segmentation_ctx
+                    .segments
+            }
+        }
+
+        /// Instruction count retired at the current boundary.
+        fn instret(&self) -> u64 {
+            #[cfg(not(feature = "rvr"))]
+            {
+                self.exec_state
+                    .as_ref()
+                    .expect("exec_state present")
+                    .ctx
+                    .segmentation_ctx
+                    .instret
+            }
+            #[cfg(feature = "rvr")]
+            {
+                self.ctx
+                    .as_ref()
+                    .expect("ctx present")
+                    .segmentation_ctx
+                    .instret
+            }
+        }
+
+        /// Clone the VM state at the current boundary (a snapshot start-state).
+        fn clone_boundary_state(&self) -> VmState<GuestMemory> {
+            #[cfg(not(feature = "rvr"))]
+            {
+                self.exec_state
+                    .as_ref()
+                    .expect("exec_state present")
+                    .vm_state
+                    .clone()
+            }
+            #[cfg(feature = "rvr")]
+            {
+                self.vm_state.as_ref().expect("vm_state present").clone()
+            }
+        }
+
+        /// Consume the driver, returning all discovered segments.
+        fn into_segments(self) -> Vec<Segment> {
+            #[cfg(not(feature = "rvr"))]
+            {
+                self.exec_state
+                    .expect("exec_state present")
+                    .ctx
+                    .segmentation_ctx
+                    .segments
+            }
+            #[cfg(feature = "rvr")]
+            {
+                self.ctx.expect("ctx present").segmentation_ctx.segments
+            }
+        }
+    }
 
     fn build_metered_ctx(
         app_prover: &ProverType,
@@ -482,15 +679,15 @@ mod real_impl {
 
     /// Cached execution instances reused across proofs.
     pub(crate) struct ExecutionInstances {
-        pub(crate) pure: ExecutionInstanceType<ExecutionCtx>,
-        pub(crate) metered: ExecutionInstanceType<MeteredCtx>,
+        pub(crate) pure: PureInstanceType,
+        pub(crate) metered: MeteredInstanceType,
     }
 
     /// Snapshot of VM state at a point during execution.
     /// Used to avoid re-executing from instruction 0 for each segment.
     #[derive(Clone)]
     struct VmSnapshot {
-        vm_state: VmState<proof::F>,
+        vm_state: VmState<GuestMemory>,
         instret: u64,
     }
 
@@ -599,27 +796,37 @@ mod real_impl {
             let executor_keepalive = Box::leak(Box::new(temp_prover.vm.executor().clone()));
             let executor_idx_to_air_idx = temp_prover.vm.executor_idx_to_air_idx();
 
-            // (b) Pure interpreter — AOT compile of asm_run for ExecutionCtx.
-            //     The compiled .so bakes raw pointers into the executor inventory.
+            // (b) Pure execution instance for fast-forwarding (by an exact
+            //     instruction count) to a segment start. ALWAYS the interpreter
+            //     — even under `rvr` — because it must be instruction-exact
+            //     (see `PureInstanceType`). Under rvr, `.instance()` would yield
+            //     the native (basic-block-boundary, imprecise) pure backend, so
+            //     we call `.interpreter_instance()` for the exact interpreter.
             let t_pure_start = Instant::now();
-            #[cfg(not(feature = "aot"))]
+            #[cfg(not(feature = "rvr"))]
             let pure = executor_keepalive.instance(exe.as_ref())?;
-            #[cfg(feature = "aot")]
-            let pure = executor_keepalive.aot_instance(exe.as_ref())?;
+            #[cfg(feature = "rvr")]
+            let pure = executor_keepalive.interpreter_instance(exe.as_ref())?;
             let t_pure_ms = t_pure_start.elapsed().as_millis();
             info!(
-                "AppExecutionInstances[{program}] (b) pure interpreter (AOT) took {}ms",
+                "AppExecutionInstances[{program}] (b) pure execution instance took {}ms",
                 t_pure_ms
             );
 
-            // (c) Metered interpreter — AOT compile of asm_run for MeteredCtx. Same pointer-bake.
+            // (c) Metered execution instance for incremental segment discovery
+            //     (suspends at each segment boundary). Interpreter by default;
+            //     the native rvr segment-boundary instance under `rvr`.
             let t_metered_start = Instant::now();
-            #[cfg(not(feature = "aot"))]
+            #[cfg(not(feature = "rvr"))]
             let metered =
                 executor_keepalive.metered_instance(exe.as_ref(), &executor_idx_to_air_idx)?;
-            #[cfg(feature = "aot")]
-            let metered =
-                executor_keepalive.metered_aot_instance(exe.as_ref(), &executor_idx_to_air_idx)?;
+            #[cfg(feature = "rvr")]
+            let metered = executor_keepalive.metered_segment_rvr_instance(
+                exe.as_ref(),
+                &executor_idx_to_air_idx,
+                temp_prover.vm.num_airs(),
+                None,
+            )?;
             let t_metered_ms = t_metered_start.elapsed().as_millis();
             info!(
                 "AppExecutionInstances[{program}] (c) metered interpreter (AOT) took {}ms",
@@ -759,27 +966,15 @@ mod real_impl {
                 });
             }
 
-            let mut exec_state = VmExecState::new(vm_state, metered_ctx);
+            let mut driver = MeteredDriver::new(metered_interpreter, vm_state, metered_ctx);
             let exec_start = std::time::Instant::now();
 
             info!("Executor thread: starting metered execution");
 
             loop {
-                exec_state = metered_interpreter.execute_metered_until_suspend(exec_state)?;
+                let should_break = driver.step()?;
 
-                // Handle exit code
-                let mut exit_code = Ok(None);
-                std::mem::swap(&mut exit_code, &mut exec_state.exit_code);
-                let exit_code = exit_code?;
-                let should_break = match exit_code {
-                    Some(code) if code != 0 => {
-                        return Err(eyre::eyre!("VM exited with non-zero exit code: {}", code));
-                    }
-                    Some(_) => true,
-                    None => false,
-                };
-
-                let curr_idx = exec_state.ctx.segmentation_ctx.segments.len() - 1;
+                let curr_idx = driver.segments().len() - 1;
 
                 // If this segment is assigned to us, send it to the prover
                 if curr_idx % num_provers == prover_id {
@@ -791,7 +986,7 @@ mod real_impl {
                             .expect("Snapshot missing for assigned segment")
                     };
 
-                    let segment = exec_state.ctx.segmentation_ctx.segments[curr_idx].clone();
+                    let segment = driver.segments()[curr_idx].clone();
 
                     info!("Executor: sending segment {} for proving", curr_idx);
                     prove_tx
@@ -812,16 +1007,16 @@ mod real_impl {
                 // see the snapshot-schedule notes on `seeds_initial_snapshot`
                 // / `saves_snapshot_at` at the top of this file.
                 if saves_snapshot_at(curr_idx, num_provers, prover_id) {
-                    let instret = exec_state.ctx.segmentation_ctx.instret;
+                    let instret = driver.instret();
                     snapshots.push_back(VmSnapshot {
-                        vm_state: exec_state.vm_state.clone(),
+                        vm_state: driver.clone_boundary_state(),
                         instret,
                     });
                 }
             }
 
             let execute_time_ms = exec_start.elapsed().as_millis() as u64;
-            let segments = exec_state.ctx.segmentation_ctx.segments.clone();
+            let segments = driver.into_segments();
             let num_segments = segments.len();
 
             info!(
@@ -869,7 +1064,7 @@ mod real_impl {
             let mut vm_state = prove_data.snapshot.vm_state;
             let num_ins = prove_data.segment.instret_start - prove_data.snapshot.instret;
             if num_ins > 0 {
-                match pure_interpreter.execute_from_state(vm_state, Some(num_ins)) {
+                match fast_forward(pure_interpreter, vm_state, num_ins) {
                     Ok(state) => vm_state = state,
                     Err(e) => {
                         prover_err = Some(e.into());
@@ -882,6 +1077,11 @@ mod real_impl {
             // Generate STARK proof for this segment
             let _ = telemetry::span_timing::drain_span_timings(); // clear stale timings
             let stark_start = std::time::Instant::now();
+            // openvm v2.1 ships only touched-marked pages to the device (unmarked
+            // → zero). Our snapshot + fast-forward reconstructs correct memory
+            // *values* but not the touched-page metadata a sequential preflight
+            // would carry, so rebuild it from the image before proving.
+            vm_state.memory.memory.recompute_touched_pages();
             let prove_result = app_prover.vm.prove(
                 &mut app_prover.interpreter,
                 vm_state,
@@ -935,8 +1135,7 @@ mod real_impl {
                 let memory_dimensions = vm_config.system.config.memory_config.memory_dimensions();
                 let hasher = vm_poseidon2_hasher();
                 user_public_values = Some(UserPublicValuesProof::compute(
-                    memory_dimensions,
-                    vm_config.system.config.num_public_values,
+                    &vm_config.system.config,
                     &hasher,
                     &memory.memory,
                     top_tree,
@@ -1080,7 +1279,7 @@ mod real_impl {
             let mut vm_state = prove_data.snapshot.vm_state;
             let num_ins = prove_data.segment.instret_start - prove_data.snapshot.instret;
             if num_ins > 0 {
-                match pure_interpreter.execute_from_state(vm_state, Some(num_ins)) {
+                match fast_forward(pure_interpreter, vm_state, num_ins) {
                     Ok(state) => vm_state = state,
                     Err(e) => {
                         return consumer_failure(format!(
@@ -1095,6 +1294,11 @@ mod real_impl {
             // Generate STARK proof for this segment
             let _ = telemetry::span_timing::drain_span_timings();
             let stark_start = std::time::Instant::now();
+            // openvm v2.1 ships only touched-marked pages to the device (unmarked
+            // → zero). Our snapshot + fast-forward reconstructs correct memory
+            // *values* but not the touched-page metadata a sequential preflight
+            // would carry, so rebuild it from the image before proving.
+            vm_state.memory.memory.recompute_touched_pages();
             let prove_result = app_prover.vm.prove(
                 &mut app_prover.interpreter,
                 vm_state,
@@ -1142,8 +1346,7 @@ mod real_impl {
                 let memory_dimensions = vm_config.system.config.memory_config.memory_dimensions();
                 let hasher = vm_poseidon2_hasher();
                 user_public_values = Some(UserPublicValuesProof::compute(
-                    memory_dimensions,
-                    vm_config.system.config.num_public_values,
+                    &vm_config.system.config,
                     &hasher,
                     &memory.memory,
                     top_tree,
@@ -1343,26 +1546,15 @@ mod real_impl {
                 });
             }
 
-            let mut exec_state = VmExecState::new(vm_state, metered_ctx);
+            let mut driver = MeteredDriver::new(metered_interpreter, vm_state, metered_ctx);
             let exec_start = std::time::Instant::now();
 
             info!("Executor thread (parallel): starting metered execution");
 
             loop {
-                exec_state = metered_interpreter.execute_metered_until_suspend(exec_state)?;
+                let should_break = driver.step()?;
 
-                let mut exit_code = Ok(None);
-                std::mem::swap(&mut exit_code, &mut exec_state.exit_code);
-                let exit_code = exit_code?;
-                let should_break = match exit_code {
-                    Some(code) if code != 0 => {
-                        return Err(eyre::eyre!("VM exited with non-zero exit code: {}", code));
-                    }
-                    Some(_) => true,
-                    None => false,
-                };
-
-                let curr_idx = exec_state.ctx.segmentation_ctx.segments.len() - 1;
+                let curr_idx = driver.segments().len() - 1;
 
                 if curr_idx % num_provers == prover_id {
                     let snapshot = if num_provers == 1 && curr_idx == 0 {
@@ -1373,7 +1565,7 @@ mod real_impl {
                             .expect("Snapshot missing for assigned segment")
                     };
 
-                    let segment = exec_state.ctx.segmentation_ctx.segments[curr_idx].clone();
+                    let segment = driver.segments()[curr_idx].clone();
 
                     info!(
                         "Executor (parallel): sending segment {} for proving",
@@ -1397,16 +1589,16 @@ mod real_impl {
                 // see the snapshot-schedule notes on `seeds_initial_snapshot`
                 // / `saves_snapshot_at` at the top of this file.
                 if saves_snapshot_at(curr_idx, num_provers, prover_id) {
-                    let instret = exec_state.ctx.segmentation_ctx.instret;
+                    let instret = driver.instret();
                     snapshots.push_back(VmSnapshot {
-                        vm_state: exec_state.vm_state.clone(),
+                        vm_state: driver.clone_boundary_state(),
                         instret,
                     });
                 }
             }
 
             let execute_time_ms = exec_start.elapsed().as_millis() as u64;
-            let segments = exec_state.ctx.segmentation_ctx.segments.clone();
+            let segments = driver.into_segments();
             let num_segments = segments.len();
 
             // Send ExecuteE2 result immediately so manager knows num_segments ASAP
@@ -1455,7 +1647,7 @@ mod real_impl {
             let mut vm_state = prove_data.snapshot.vm_state;
             let num_ins = prove_data.segment.instret_start - prove_data.snapshot.instret;
             if num_ins > 0 {
-                match pure_interpreter.execute_from_state(vm_state, Some(num_ins)) {
+                match fast_forward(pure_interpreter, vm_state, num_ins) {
                     Ok(state) => vm_state = state,
                     Err(e) => {
                         prover_err = Some(e.into());
@@ -1467,6 +1659,11 @@ mod real_impl {
 
             let _ = telemetry::span_timing::drain_span_timings();
             let stark_start = std::time::Instant::now();
+            // openvm v2.1 ships only touched-marked pages to the device (unmarked
+            // → zero). Our snapshot + fast-forward reconstructs correct memory
+            // *values* but not the touched-page metadata a sequential preflight
+            // would carry, so rebuild it from the image before proving.
+            vm_state.memory.memory.recompute_touched_pages();
             let prove_result = app_prover.vm.prove(
                 &mut app_prover.interpreter,
                 vm_state,
@@ -1517,8 +1714,7 @@ mod real_impl {
                 let memory_dimensions = vm_config.system.config.memory_config.memory_dimensions();
                 let hasher = vm_poseidon2_hasher();
                 user_public_values = Some(UserPublicValuesProof::compute(
-                    memory_dimensions,
-                    vm_config.system.config.num_public_values,
+                    &vm_config.system.config,
                     &hasher,
                     &memory.memory,
                     top_tree,
