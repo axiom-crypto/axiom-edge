@@ -37,9 +37,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # The rvr execution backend (openvm develop-v2.1.0, successor to the removed
 # `aot` backend) compiles native FFI (blst / secp256k1 / keccak) with clang and
 # requires clang >= 19. Ubuntu 24.04's `clang` package is clang-18, so install a
-# newer clang from apt.llvm.org and point RVR_CC at it. Bump CLANG_VERSION in
-# lockstep with the clang used on production/dev hosts.
-ARG CLANG_VERSION=21
+# newer clang from apt.llvm.org and point RVR_CC at it. Pinned to clang-22 to
+# match the runtime stage below and openvm's rvr default (`CC ?= clang-22`), so
+# the FFI that ships is built with the same compiler the whole stack uses. Keep
+# this in lockstep with the runtime CLANG_VERSION and CI (.github/workflows).
+ARG CLANG_VERSION=22
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
@@ -175,11 +177,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # not just the builder — needs clang (>= 19), lld, and make. Ubuntu 24.04 ships
 # clang-18, so install a newer clang+lld from apt.llvm.org and point RVR_CC /
 # RVR_LD at them (openvm otherwise probes for a bare `clang` / `lld`, which the
-# versioned packages don't provide). Must be clang-22 here: the rvr guest→native
-# codegen (openvm develop-v2.1.0) is compiled with `-Werror,-Wsign-conversion`
-# and only builds clean on clang-22 (its `DEFAULT_CLANG_COMMAND`); clang-21
-# errors out. The builder stage's FFI static libs compile fine on clang-21, so
-# only this runtime stage needs to be bumped.
+# versioned packages don't provide). Pinned to clang-22 to match openvm's rvr
+# default (`CC ?= clang-22`) and the compiler openvm validates its generated
+# code against: the guest codegen is compiled with `-Weverything -Werror`, whose
+# warning set is clang-version-sensitive, so the whole stack (this runtime, the
+# builder above, and CI) is kept on clang-22 to match what openvm builds/tests.
 ARG CLANG_VERSION=22
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \

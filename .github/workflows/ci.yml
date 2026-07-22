@@ -105,13 +105,15 @@ jobs:
   # compiles fine on stable despite its historical "requires nightly" note.
   #
   # `rvr` (successor to the removed `aot` backend) compiles native FFI with
-  # clang (>= 19); ubuntu-latest ships clang-18, so install a newer clang from
-  # apt.llvm.org and point RVR_CC at it.
+  # clang (>= 19); ubuntu-latest ships clang-18. We install clang-22 to match
+  # production and openvm's rvr default (`CC ?= clang-22`, openvm's own CI also
+  # installs 22), so this gate validates the FFI against the same compiler that
+  # ships. Install from apt.llvm.org and point RVR_CC at it.
   prod-features-cpu:
     name: check prod CPU features (compile-only)
     runs-on: ubuntu-latest
     env:
-      RVR_CC: clang-19
+      RVR_CC: clang-22
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.1
@@ -119,7 +121,7 @@ jobs:
         run: |
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19
+          sudo /tmp/llvm.sh 22
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: prod-features-cpu
@@ -175,7 +177,7 @@ jobs:
       # produced for production (config/defaults.toml cuda_arch).
       CUDA_ARCH: "89,120"
       # rvr native FFI is compiled with clang; installed below from apt.llvm.org.
-      RVR_CC: clang-19
+      RVR_CC: clang-22
     steps:
       - uses: actions/checkout@v4
       # The container is bare (no rustup/git/cc). checkout falls back to the
@@ -186,10 +188,11 @@ jobs:
           apt-get install -y --no-install-recommends \
             curl ca-certificates git build-essential pkg-config libssl-dev \
             wget lsb-release gnupg software-properties-common
-          # rvr native FFI needs clang >= 19 (Ubuntu 24.04 ships clang-18).
+          # rvr native FFI needs clang >= 19; use clang-22 to match production
+          # and openvm's rvr default (Ubuntu 24.04 ships clang-18).
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
-          /tmp/llvm.sh 19
+          /tmp/llvm.sh 22
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain 1.91.1 --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
