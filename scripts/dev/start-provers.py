@@ -34,6 +34,27 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 DOCKER_DIR = REPO_ROOT / "docker"
 TEMPLATES_DIR = REPO_ROOT / "config" / "templates"
+
+
+def detect_rvr_cc() -> str | None:
+    """Pick a clang for openvm's `rvr` execution backend, or None.
+
+    rvr (successor to the removed `aot` backend) compiles native FFI
+    (blst / secp256k1 / keccak) and requires LLVM clang >= 19. openvm's build
+    script only auto-discovers `clang-22` or a plain `clang`; many hosts have
+    only versioned `clang-NN` binaries, so we point RVR_CC at the newest one.
+    Returns None if RVR_CC is already set (caller's choice wins) or no suitable
+    clang is found (let the build surface openvm's own error).
+    """
+    if os.environ.get("RVR_CC"):
+        return None
+    for major in range(30, 18, -1):
+        cand = f"clang-{major}"
+        if shutil.which(cand):
+            return cand
+    if shutil.which("clang"):
+        return "clang"
+    return None
 DEFAULTS_FILE = REPO_ROOT / "config" / "defaults.toml"
 
 
@@ -107,7 +128,7 @@ class Args:
     halo2_mode: str
     # Whether to add `evm-prove` to the build features (root -> halo2). True for
     # halo2 modes "full" and "dedicated"; false for "none" (stark-only). `--features`
-    # *replaces* the whole default set (`cuda,jemalloc,parallel,aot,unprotected`),
+    # *replaces* the whole default set (`cuda,jemalloc,parallel,rvr,unprotected`),
     # so this instead appends evm-prove to the defaults.
     with_evm: bool
     # Deferral keyset wiring — independent of halo2. When `with_deferral=True`, run
@@ -1222,6 +1243,16 @@ def ensure_artifacts(
     if need_shared_keygen:
         bins_to_build.append("keygen")
 
+    # The local keygen build inherits the production features minus `cuda`, so it
+    # still enables `rvr`, whose native FFI needs clang (>= 19). Point RVR_CC at
+    # a suitable clang if the caller hasn't (the Docker image sets its own).
+    build_cargo_env = dict(os.environ)
+    if "rvr" in keygen_features.split(","):
+        rvr_cc = detect_rvr_cc()
+        if rvr_cc:
+            build_cargo_env["RVR_CC"] = rvr_cc
+            print(f"  Using RVR_CC={rvr_cc} for the rvr native build")
+
     for bin_name in bins_to_build:
         cargo_cmd: list[str] = ["cargo"]
         if toolchain:
@@ -1236,6 +1267,7 @@ def ensure_artifacts(
             capture_output=True,
             text=True,
             check=False,
+            env=build_cargo_env,
         )
         tail = (result.stdout + result.stderr).splitlines()[-5:]
         for line in tail:

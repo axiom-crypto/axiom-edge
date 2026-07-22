@@ -54,7 +54,10 @@ const BABYBEAR_MODULUS_POW8_BE: [u8; 32] = [
 mod real_types {
     use openvm_stark_backend::proof::Proof;
     use openvm_stark_backend::Val;
-    use sdk_v2::openvm_circuit::system::memory::CHUNK;
+    // openvm develop-v2.1.0 removed `system::memory::CHUNK`; the memory merkle
+    // digest width is now `VM_DIGEST_WIDTH` (still 8). Alias it to `CHUNK` so
+    // the const-generic uses below read the same.
+    use sdk_v2::openvm_circuit::arch::instructions::VM_DIGEST_WIDTH as CHUNK;
 
     /// The field type used for proofs (BabyBear).
     pub type F = Val<sdk_v2::SC>;

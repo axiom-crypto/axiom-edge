@@ -25,7 +25,7 @@ services:
         TARGET_CPU: ${TARGET_CPU:-native}
         BUILDER_IMAGE: ${BUILDER_IMAGE:-nvidia/cuda:13.1.0-devel-ubuntu24.04}
         RUNTIME_IMAGE: ${RUNTIME_IMAGE:-nvidia/cuda:13.1.0-runtime-ubuntu24.04}
-        FEATURES: ${FEATURES:-cuda,jemalloc,parallel,aot,unprotected}
+        FEATURES: ${FEATURES:-cuda,jemalloc,parallel,rvr,unprotected}
         TOOLCHAIN_VERSION: ${TOOLCHAIN_VERSION:-+nightly-2025-08-19}
         VCS_REF: ${VCS_REF:-unknown}
         OPENVM_REV: ${OPENVM_REV:-unknown}
