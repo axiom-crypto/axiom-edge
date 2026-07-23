@@ -232,13 +232,33 @@ impl TryFrom<EvmProofWire> for EvmProof {
         use continuations_v2::CommitBytes;
         use sdk_v2::types::{AppExecutionCommit, ProofData};
 
+        /// The BabyBear modulus (`p`) to the 8th power, as 32 big-endian
+        /// bytes. A `CommitBytes` is the canonical big-endian encoding of a
+        /// BabyBear digest recomposed as an integer in base `p`; canonicity —
+        /// what `CommitBytes::new` asserts via a decompose/recompose
+        /// round-trip — is exactly "the 32-byte BE integer is < p^8", i.e.
+        /// lexicographically below this constant.
+        const BABYBEAR_MODULUS_POW8_BE: [u8; 32] = [
+            0x00, 0x98, 0xc2, 0x9b, 0x8b, 0x2f, 0x1b, 0x6f, 0x4c, 0x0a, 0x66, 0x71, 0x44, 0x70,
+            0xa4, 0x03, 0x61, 0x2c, 0x60, 0x05, 0xc4, 0x90, 0x00, 0x06, 0x27, 0x00, 0x00, 0x03,
+            0xc0, 0x00, 0x00, 0x01,
+        ];
+
+        // Pre-check the canonicity condition explicitly instead of catching
+        // `CommitBytes::new`'s assert panic: `catch_unwind` turns into a
+        // process abort under a `panic = "abort"` profile, and even under
+        // unwinding it fires the panic hook (a spurious backtrace in the logs)
+        // for every corrupt input.
         fn commit_bytes(bytes: Vec<u8>, field: &str) -> Result<CommitBytes> {
             let len = bytes.len();
             let bytes: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| eyre::eyre!("{field} must be 32 bytes, got {len}"))?;
-            std::panic::catch_unwind(|| CommitBytes::new(bytes))
-                .map_err(|_| eyre::eyre!("{field} is not canonical CommitBytes"))
+            if bytes >= BABYBEAR_MODULUS_POW8_BE {
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                eyre::bail!("{field} (0x{hex}) is not a canonical CommitBytes (>= p^8)");
+            }
+            Ok(CommitBytes::new(bytes))
         }
 
         Ok(Self {
@@ -450,19 +470,18 @@ mod tests {
         );
     }
 
-    /// Negative test for the non-canonical (panic-from-`CommitBytes::new`)
-    /// branch of the `commit_bytes` helper. `CommitBytes` is the BN254
-    /// scalar wrapper used to commit to app code + VM; non-canonical
-    /// representations (above the field modulus) panic on construction.
-    /// We catch that panic with `catch_unwind` and surface a typed error.
+    /// Negative test for the non-canonical branch of the `commit_bytes`
+    /// helper. `CommitBytes` is the canonical big-endian encoding of a
+    /// BabyBear digest recomposed as an integer in base `p` (the BabyBear
+    /// modulus); canonicity is "BE integer < p^8". The decoder pre-checks
+    /// that bound explicitly (no `catch_unwind`: it would abort under a
+    /// `panic = "abort"` profile) and surfaces a typed error.
     #[cfg(all(not(feature = "mock-provers"), feature = "evm-prove"))]
     #[test]
     fn evm_proof_decode_rejects_noncanonical_commit() {
         use super::{decode_evm_proof, EvmProofWire};
 
-        // All-0xFF is above the BN254 scalar modulus → non-canonical.
-        // CommitBytes::new(...) panics; the decoder catch_unwinds and
-        // returns a typed error.
+        // All-0xFF is >= p^8 → non-canonical → typed error, no panic.
         let wire = EvmProofWire {
             version: "v2.0".to_string(),
             app_exe_commit: vec![0xFFu8; 32],
@@ -478,5 +497,46 @@ mod tests {
             msg.contains("app_exe_commit") && msg.contains("canonical"),
             "expected non-canonical diagnostic for app_exe_commit, got {msg}",
         );
+    }
+
+    /// Regression for the accept side: a real halo2 `EvmProof` carries commits
+    /// in the recomposed-integer form, whose bytes are NOT eight small
+    /// little-endian limbs (this prefix is from an actual lighter devnet
+    /// final-agg proof — a LE-limb misreading rejects it as "limb 0
+    /// (0x87926700) non-canonical"). The decoder must accept any 32-byte BE
+    /// integer up to and excluding p^8.
+    #[cfg(all(not(feature = "mock-provers"), feature = "evm-prove"))]
+    #[test]
+    fn evm_proof_decode_accepts_recomposed_integer_commits() {
+        use super::{decode_evm_proof, EvmProofWire};
+
+        let make = |commit: [u8; 32]| {
+            bincode::serialize(&EvmProofWire {
+                version: "v2.0".to_string(),
+                app_exe_commit: commit.to_vec(),
+                app_vm_commit: commit.to_vec(),
+                user_public_values: vec![],
+                accumulator: vec![],
+                proof: vec![],
+            })
+            .expect("bincode encodes")
+        };
+
+        // Observed-in-the-wild prefix, padded with 0xff — still < p^8.
+        let mut real = [0xffu8; 32];
+        real[..4].copy_from_slice(&[0x00, 0x67, 0x92, 0x87]);
+        let decoded = decode_evm_proof(&make(real)).expect("canonical commit decodes");
+        assert_eq!(decoded.app_commit.app_exe_commit.as_slice(), &real);
+
+        // Boundary: p^8 - 1 is the last canonical value; p^8 itself is not.
+        let p8: [u8; 32] = [
+            0x00, 0x98, 0xc2, 0x9b, 0x8b, 0x2f, 0x1b, 0x6f, 0x4c, 0x0a, 0x66, 0x71, 0x44, 0x70,
+            0xa4, 0x03, 0x61, 0x2c, 0x60, 0x05, 0xc4, 0x90, 0x00, 0x06, 0x27, 0x00, 0x00, 0x03,
+            0xc0, 0x00, 0x00, 0x01,
+        ];
+        assert!(decode_evm_proof(&make(p8)).is_err());
+        let mut max_canonical = p8;
+        max_canonical[31] -= 1;
+        assert!(decode_evm_proof(&make(max_canonical)).is_ok());
     }
 }

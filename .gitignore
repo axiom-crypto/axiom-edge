@@ -41,3 +41,6 @@ axiom-artifacts
 **/metrics-output
 
 .orchestrator/*
+
+# Local-only doc for the cross-repo export flow
+docs/START_WITH_ARTIFACTS.md

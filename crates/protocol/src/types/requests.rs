@@ -273,6 +273,15 @@ pub struct ShardedAppProveRequest {
     /// Optional override for OPENVM_MAX_SEGMENT_MEMORY.
     #[serde(default)]
     pub segment_memory: Option<usize>,
+    /// Number of deferral circuits THIS proof exercises — the count of
+    /// `DeferralState`s the caller staged for it. `0` for a proof that makes no
+    /// deferred calls (e.g. a leaf on a deferral deployment, whose family shares
+    /// one deferral-enabled keyset): the worker then waits for no `DeferralState`
+    /// and takes the depth-0 path, and the manager attaches no tail-merge.
+    /// `None` (an older manager that doesn't send it) falls back to the worker's
+    /// loaded keyset circuit count, preserving prior behavior.
+    #[serde(default)]
+    pub num_deferral_circuits: Option<usize>,
 }
 
 /// Leaf prove request — aggregate a batch of app proofs into a leaf proof.

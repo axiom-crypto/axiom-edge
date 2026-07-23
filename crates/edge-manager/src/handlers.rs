@@ -3,7 +3,7 @@
 use axum::{
     body::Bytes,
     extract::{Multipart, Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -89,6 +89,12 @@ pub struct AppState {
     /// (main + deferral states) and the final-internal JIT dispatch
     /// (deferral inputs). See [`StagedInputs`].
     pub staged_inputs: DashMap<String, StagedInputs>,
+    /// Root of the artifacts export mounted into the container (from
+    /// `server.artifacts_path`, defaulting to the standard `--from-artifacts`
+    /// mount `/data/artifacts`). `GET /vk/{name}` serves per-program
+    /// verifying-key blobs verbatim from its `vk/` subdir; the manager never
+    /// reads or interprets anything else in it.
+    pub artifacts_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -98,6 +104,14 @@ impl AppState {
             EdgeWorkerRegistry::new(config.server.num_workers, config.provers.clone());
         let state_store = EdgeStateStore::new(config.provers.max_leaf_provers);
         let programs_set: HashSet<ProgramRef> = programs.iter().cloned().collect();
+        // Root of the mounted artifacts export, served by `GET /vk/{name}`.
+        // Defaults to the standard `--from-artifacts` container mount when the
+        // config leaves `artifacts_path` unset.
+        let artifacts_path = config
+            .server
+            .artifacts_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/data/artifacts"));
         Self {
             config,
             worker_registry,
@@ -122,6 +136,7 @@ impl AppState {
             programs,
             programs_set,
             staged_inputs: DashMap::new(),
+            artifacts_path,
         }
     }
 }
@@ -250,6 +265,137 @@ pub async fn upload_input(
         proof_uuid, has_main, n_states, n_inputs
     );
     (StatusCode::OK, "Input staged".to_string())
+}
+
+/// The relative path of a program's verifying-key blob inside the mounted
+/// artifacts export, or `None` when `name` is not an acceptable program name.
+///
+/// Names are restricted to non-empty ASCII `[A-Za-z0-9._-]` with no `..`
+/// substring. Axum single-segment path params can never contain `/`, but the
+/// name becomes a filesystem path component, so it is validated here anyway
+/// (belt and braces against traversal).
+fn vk_rel_path(name: &str) -> Option<String> {
+    if name.is_empty()
+        || name.contains("..")
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(format!("vk/{name}.app_vm_vk.bin"))
+}
+
+/// `GET /vk/{name}` — download a program's verifying-key blob, verbatim.
+///
+/// A `--from-artifacts` deployment's export may include per-program
+/// verifying-key blobs at the conventional `vk/{name}.app_vm_vk.bin` path
+/// inside the mounted artifacts directory. This endpoint serves those files
+/// as raw bytes — the manager never decodes them; what a blob means is
+/// entirely between the exporter and the caller. An aggregation caller
+/// downloads the key for each of its child programs once, to verify child
+/// proofs and frame aggregation jobs. Callers know their own program names.
+/// A deployment whose export ships no such files (e.g. a mock stack) simply
+/// answers `404`.
+pub async fn download_vk(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(rel) = vk_rel_path(&name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid program name"})),
+        )
+            .into_response();
+    };
+    match tokio::fs::read(state.artifacts_path.join(rel)).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no verifying key for program '{name}' on this deployment")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /proof/{proof_uuid}` — download a completed proof's final artifact as
+/// raw, **uncompressed** bytes.
+///
+/// Served from the on-disk copy the manager writes at completion
+/// ([`crate::proof_state::persistence`]) — an openvm-codec `VmStarkProof` for a
+/// `Stark` proof, or the raw bincode evm proof for an `Evm` proof. It must come
+/// from disk, not the in-memory state: on completion the manager persists the
+/// proof and then `compact_completed_state` drops every in-memory proof payload,
+/// so the bytes only survive on disk. **Requires `proof.persist_final_proofs_dir`**
+/// — without it `persisted_final_proof_path` is never set and this returns `404`.
+///
+/// If the deployment persists compressed (`compress_persisted_final_proofs`),
+/// the bytes are zstd-decoded here so callers always receive the raw payload.
+/// Returns `404` when the proof is unknown, not yet `Completed`, or not
+/// persisted — the caller's poll loop treats that as "retry", so probing an
+/// in-flight proof is safe.
+pub async fn download_proof(
+    State(state): State<Arc<AppState>>,
+    Path(proof_uuid): Path<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_manager_proof_uuid(&proof_uuid) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid proof_uuid: {reason}"),
+        )
+            .into_response();
+    }
+    let proof_state = state.proof_states.get(&proof_uuid).map(|s| s.clone());
+    let Some(proof_state) = proof_state else {
+        return (StatusCode::NOT_FOUND, "proof not found".to_string()).into_response();
+    };
+    let persisted_path = { proof_state.lock().await.persisted_final_proof_path.clone() };
+    let Some(path) = persisted_path else {
+        return (
+            StatusCode::NOT_FOUND,
+            "proof not available (not completed, or persistence disabled)".to_string(),
+        )
+            .into_response();
+    };
+
+    // Read (and, if the deployment compresses persisted proofs, decompress) off
+    // the async executor — proofs can be multi-MB and zstd decode is CPU-bound.
+    let compressed = state.config.proof.compress_persisted_final_proofs;
+    let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        let bytes = std::fs::read(&path)?;
+        if compressed {
+            zstd::decode_all(&bytes[..])
+        } else {
+            Ok(bytes)
+        }
+    })
+    .await;
+    match read {
+        Ok(Ok(bytes)) => (StatusCode::OK, bytes).into_response(),
+        Ok(Err(e)) => {
+            error!("failed to read persisted proof for {proof_uuid}: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read persisted proof: {e}"),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!("persisted-proof read task failed for {proof_uuid}: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read task failed: {e}"),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Response for start_proof endpoint.
@@ -909,6 +1055,10 @@ pub async fn start_proof(
             prover_id: worker_id,
             num_provers,
             segment_memory: req.segment_memory,
+            // Per-proof deferral count (0 for a no-deferred-calls proof like a
+            // leaf): the worker waits for exactly this many `DeferralState`s
+            // rather than assuming its keyset-wide circuit count.
+            num_deferral_circuits: Some(num_deferral_circuits),
         };
 
         let client = state.http_client.clone();
@@ -1961,4 +2111,94 @@ async fn abort_proof_with_failure(
             "proof_uuid": proof_uuid,
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        LifecycleConfig, MetricsConfig, ProofConfig, ProversConfig, ServerConfig, TelemetryConfig,
+    };
+    use std::path::PathBuf;
+
+    fn test_state(artifacts_path: PathBuf) -> Arc<AppState> {
+        let config = ManagerConfig {
+            server: ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                num_workers: 1,
+                artifacts_path: Some(artifacts_path),
+            },
+            proof: ProofConfig::default(),
+            provers: ProversConfig {
+                max_app_provers: 1,
+                max_leaf_provers: 1,
+                max_internal_provers: 1,
+            },
+            lifecycle: LifecycleConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            metrics: MetricsConfig::default(),
+        };
+        Arc::new(AppState::new(config, vec![]))
+    }
+
+    #[test]
+    fn vk_rel_path_maps_valid_names_to_the_conventional_blob_path() {
+        assert_eq!(
+            vk_rel_path("evm-leaf").as_deref(),
+            Some("vk/evm-leaf.app_vm_vk.bin")
+        );
+        assert_eq!(
+            vk_rel_path("prog_1.v2").as_deref(),
+            Some("vk/prog_1.v2.app_vm_vk.bin")
+        );
+    }
+
+    #[test]
+    fn vk_rel_path_rejects_bad_names() {
+        for bad in ["", "..", "a..b", "a/b", "a\\b", "a b", "naïve", "a\0b"] {
+            assert_eq!(vk_rel_path(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn download_vk_serves_an_existing_blob_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("vk")).unwrap();
+        let blob: &[u8] = b"opaque vk bytes \x00\x01\x02";
+        std::fs::write(dir.path().join("vk/evm-leaf.app_vm_vk.bin"), blob).unwrap();
+        let state = test_state(dir.path().to_path_buf());
+
+        let resp = download_vk(State(state), Path("evm-leaf".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], blob);
+    }
+
+    #[tokio::test]
+    async fn download_vk_missing_file_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf());
+        let resp = download_vk(State(state), Path("evm-leaf".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn download_vk_invalid_name_is_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf());
+        let resp = download_vk(State(state), Path("..".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
