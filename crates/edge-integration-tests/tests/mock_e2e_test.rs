@@ -368,7 +368,7 @@ async fn mock_e2e_start_proof_rejects_unknown_program() -> Result<()> {
 
 /// Single-active-proof gate (the "one active proof at a time" invariant): while
 /// one proof is active, a second `/start_proof` with a distinct uuid is
-/// rejected with 409 + "Another proof is already running". The second request
+/// rejected with 409 + `deployment_busy`. The second request
 /// is fired immediately after the first is admitted — the manager initializes
 /// the first proof's scheduler state *before* `/start_proof` returns, so the
 /// gate is reliably engaged regardless of mock proving speed (no race).
@@ -416,7 +416,7 @@ async fn mock_e2e_rejects_second_active_proof() -> Result<()> {
         "a second proof while one is active must be rejected"
     );
     let body: Value = resp.json().await?;
-    assert_eq!(body["error"], "Another proof is already running");
+    assert_eq!(body["error"], "deployment_busy");
 
     Ok(())
 }
@@ -467,7 +467,7 @@ async fn mock_e2e_rejects_duplicate_proof_uuid() -> Result<()> {
         .await?;
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     let body: Value = resp.json().await?;
-    assert_eq!(body["error"], "Proof already exists");
+    assert_eq!(body["error"], "proof_already_exists");
 
     Ok(())
 }
@@ -565,25 +565,13 @@ async fn mock_e2e_evm_proof_type_completes_with_evm_artifact() -> Result<()> {
     // E2E completion signal that the full root→halo2 EVM prove flowed
     // through (worker → manager → persistence).
     //
-    // Persistence runs on a spawn_blocking task after the proof state
-    // flips to Completed and notifies waiters. wait_for_terminal_status
-    // returns as soon as `/proof_state` reports `completed`, so we briefly
-    // poll for the file to appear instead of asserting on a single read.
     let evm_path = persist_dir.path().join(format!("{}.evm.bin", proof_uuid));
     let stark_path = persist_dir.path().join(format!("{}.proof.bin", proof_uuid));
-    let evm_artifact_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if evm_path.is_file() {
-            break;
-        }
-        if Instant::now() >= evm_artifact_deadline {
-            return Err(eyre::eyre!(
-                "expected evm artifact at {} within timeout",
-                evm_path.display()
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert!(
+        evm_path.is_file(),
+        "Completed must imply that the Evm artifact is persisted at {}",
+        evm_path.display()
+    );
 
     let bytes = std::fs::read(&evm_path)?;
     assert!(

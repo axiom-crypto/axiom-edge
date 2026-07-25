@@ -119,9 +119,11 @@ impl ProofState {
         };
 
         if self.is_completed() {
-            info!("Proof {} is completed", self.context.proof_uuid);
-            self.status = ProofStatus::Completed;
-            self.notify_completion();
+            info!(
+                "Proof {} is ready for finalization",
+                self.context.proof_uuid
+            );
+            self.status = ProofStatus::Finalizing;
 
             let completion_time = Utc::now();
             let e2e_latency_ms = (completion_time - self.proof_start_time).num_milliseconds();
@@ -1709,7 +1711,7 @@ mod tests {
         assert!(matches!(state.status, ProofStatus::InProgress));
 
         // The Evm result arrives (the only result the worker posts for the EVM
-        // step): flip to Completed via the shared completion path.
+        // step): flip to Finalizing via the shared completion path.
         state
             .handle_proof_result(ProofResult::Evm(protocol::EvmProof {
                 context: context.clone(),
@@ -1721,7 +1723,7 @@ mod tests {
                 },
             }))
             .unwrap();
-        assert!(matches!(state.status, ProofStatus::Completed));
+        assert!(matches!(state.status, ProofStatus::Finalizing));
         assert!(state.is_completed());
         assert!(
             state.e2e_latency_ms.is_some(),
@@ -1735,7 +1737,7 @@ mod tests {
     #[test]
     fn stark_proof_still_completes_on_final_internal() {
         // Stark path must remain unchanged: final-internal arrival flips
-        // is_completed() and the shared path marks Completed.
+        // is_completed() and the shared path marks Finalizing.
         let context = make_context();
         let mut state = ProofState::new(context.clone(), 1_000_000, 4, 4, 3, 300);
         state.num_segments = Some(4);
@@ -1775,7 +1777,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(matches!(state.status, ProofStatus::Completed));
+        assert!(matches!(state.status, ProofStatus::Finalizing));
         assert!(state.get_stark_proof().is_some());
         assert!(
             state.get_evm_proof().is_none(),
@@ -1883,7 +1885,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(matches!(state.status, ProofStatus::Completed));
+        assert!(matches!(state.status, ProofStatus::Finalizing));
         let evm = state.get_evm_proof().expect("evm proof present");
         assert_eq!(evm.len(), 4096);
         assert!(state.e2e_latency_ms.is_some());

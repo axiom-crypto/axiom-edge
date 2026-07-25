@@ -106,10 +106,13 @@ impl ProofState {
     /// - `Stark` ⇒ (`VmStarkProof` openvm-codec bytes, `"proof.bin"`)
     /// - `Evm`   ⇒ (raw bincode evm proof bytes, `"evm.bin"`)
     ///
-    /// `None` until [`ProofStatus::Completed`] and the final artifact is
-    /// present.
+    /// `None` until the proof is ready for finalization and the final artifact
+    /// is present.
     fn final_proof_payload(&self) -> Result<Option<(Vec<u8>, &'static str)>> {
-        if !matches!(self.status, ProofStatus::Completed) {
+        if !matches!(
+            self.status,
+            ProofStatus::Finalizing | ProofStatus::Completed
+        ) {
             return Ok(None);
         }
 

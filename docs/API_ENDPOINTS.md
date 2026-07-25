@@ -42,7 +42,9 @@ There is **no** deferral field on this request. Whether a proof is a deferral pr
 }
 ```
 
-- **409 Conflict**: Another proof is already running, proof UUID already exists, or the requested program is not in the loadout
+- **409 Conflict**: Another proof is already running (`deployment_busy`), the
+  proof UUID already exists (`proof_already_exists`), or the requested program
+  is not in the loadout (`program_not_in_loadout`)
 ```json
 {
   "error": "program_not_in_loadout",
@@ -177,6 +179,25 @@ Return the manager's canonical program loadout (parsed once at startup from `EDG
 
 ---
 
+### GET `/capabilities`
+
+Return manager features that affect client-visible guarantees.
+
+**Response (JSON):**
+
+- **200 OK**:
+```json
+{
+  "proof_persistence_enabled": true
+}
+```
+
+When `true`, `completed` means the final artifact was successfully written to
+the configured persistence directory and is available through
+`GET /proof/{proof_uuid}`.
+
+---
+
 ### GET `/workers`
 
 Query the current worker registration status.
@@ -248,6 +269,23 @@ Get the current state of a proof.
 ```
 
 - **404 Not Found**: Proof not found
+
+---
+
+### GET `/proof/{proof_uuid}`
+
+Download a persisted final proof. The persistence directory is the source of
+truth, so this endpoint remains usable after the proof's in-memory state is
+evicted or the manager restarts.
+
+The response is the uncompressed OpenVM-codec STARK proof or opaque bincode EVM
+proof payload. When on-disk compression is enabled, the manager decompresses it
+before responding.
+
+- **200 OK**: Final proof bytes (`application/octet-stream`)
+- **404 Not Found**: Persistence is disabled or no artifact exists for the UUID
+- **500 Internal Server Error**: Both STARK and EVM artifacts exist for the UUID,
+  or the artifact could not be read
 
 ---
 
@@ -584,7 +622,8 @@ Possible proof states:
 | Status | Description |
 |--------|-------------|
 | `in_progress` | Proof is currently being generated |
-| `completed` | Proof completed successfully |
+| `finalizing` | The final artifact exists in memory and manager-side finalization/persistence is running |
+| `completed` | Proof completed successfully; when persistence is enabled, its final artifact is already durable and downloadable |
 | `failing` | A worker reported a fatal error; the manager is draining peer workers before settling into `failed` (transient, non-terminal) |
 | `failed` | Proof failed with error message |
 | `canceled` | Proof was canceled |

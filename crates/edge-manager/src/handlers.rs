@@ -330,17 +330,17 @@ pub async fn download_vk(
 ///
 /// Served from the on-disk copy the manager writes at completion
 /// ([`crate::proof_state::persistence`]) — an openvm-codec `VmStarkProof` for a
-/// `Stark` proof, or the raw bincode evm proof for an `Evm` proof. It must come
-/// from disk, not the in-memory state: on completion the manager persists the
-/// proof and then `compact_completed_state` drops every in-memory proof payload,
-/// so the bytes only survive on disk. **Requires `proof.persist_final_proofs_dir`**
-/// — without it `persisted_final_proof_path` is never set and this returns `404`.
+/// `Stark` proof, or the raw bincode evm proof for an `Evm` proof. The persisted
+/// directory is the source of truth: lookup deliberately does not consult
+/// `proof_states`, so completed proofs remain downloadable after in-memory
+/// eviction or a manager restart. **Requires `proof.persist_final_proofs_dir`**;
+/// without it this returns `404`.
 ///
 /// If the deployment persists compressed (`compress_persisted_final_proofs`),
 /// the bytes are zstd-decoded here so callers always receive the raw payload.
-/// Returns `404` when the proof is unknown, not yet `Completed`, or not
-/// persisted — the caller's poll loop treats that as "retry", so probing an
-/// in-flight proof is safe.
+/// Returns `404` when neither persisted artifact exists, so probing an
+/// in-flight proof is safe. Seeing both artifact kinds for one UUID is an
+/// invariant violation and returns `500`.
 pub async fn download_proof(
     State(state): State<Arc<AppState>>,
     Path(proof_uuid): Path<String>,
@@ -352,17 +352,43 @@ pub async fn download_proof(
         )
             .into_response();
     }
-    let proof_state = state.proof_states.get(&proof_uuid).map(|s| s.clone());
-    let Some(proof_state) = proof_state else {
-        return (StatusCode::NOT_FOUND, "proof not found".to_string()).into_response();
-    };
-    let persisted_path = { proof_state.lock().await.persisted_final_proof_path.clone() };
-    let Some(path) = persisted_path else {
+    let Some(dir) = state.config.proof.persist_final_proofs_dir.as_ref() else {
         return (
             StatusCode::NOT_FOUND,
-            "proof not available (not completed, or persistence disabled)".to_string(),
+            "proof persistence is disabled".to_string(),
         )
             .into_response();
+    };
+    let stark_path = dir.join(format!("{proof_uuid}.proof.bin"));
+    let evm_path = dir.join(format!("{proof_uuid}.evm.bin"));
+    let (stark_exists, evm_exists) = match tokio::try_join!(
+        tokio::fs::try_exists(&stark_path),
+        tokio::fs::try_exists(&evm_path)
+    ) {
+        Ok(exists) => exists,
+        Err(e) => {
+            error!("failed to inspect persisted proof paths for {proof_uuid}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("inspect persisted proof: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let path = match (stark_exists, evm_exists) {
+        (true, false) => stark_path,
+        (false, true) => evm_path,
+        (false, false) => {
+            return (StatusCode::NOT_FOUND, "proof not found".to_string()).into_response();
+        }
+        (true, true) => {
+            error!("both STARK and EVM persisted artifacts exist for {proof_uuid}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "multiple persisted proof artifacts found".to_string(),
+            )
+                .into_response();
+        }
     };
 
     // Read (and, if the deployment compresses persisted proofs, decompress) off
@@ -409,6 +435,20 @@ pub struct StartProofResponse {
 #[derive(serde::Serialize)]
 pub struct HealthzResponse {
     pub status: String,
+}
+
+/// Manager capabilities that affect caller-visible API guarantees.
+#[derive(serde::Serialize)]
+pub struct CapabilitiesResponse {
+    /// Whether completed proofs are durably persisted and available through
+    /// `GET /proof/{proof_uuid}`.
+    pub proof_persistence_enabled: bool,
+}
+
+pub async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(CapabilitiesResponse {
+        proof_persistence_enabled: state.config.proof.persist_final_proofs_dir.is_some(),
+    })
 }
 
 /// Response for manager-controlled worker readiness.
@@ -684,7 +724,10 @@ pub async fn start_proof(
         );
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Another proof is already running"})),
+            Json(serde_json::json!({
+                "error": "deployment_busy",
+                "message": "Another proof is already running",
+            })),
         );
     }
 
@@ -693,7 +736,10 @@ pub async fn start_proof(
         error!("Proof {} already exists", req.proof_uuid);
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Proof already exists"})),
+            Json(serde_json::json!({
+                "error": "proof_already_exists",
+                "message": "Proof already exists",
+            })),
         );
     }
 
@@ -1440,8 +1486,9 @@ struct CompletedProofMeta {
     proving_cycles: Option<u64>,
 }
 
-/// Finalize a proof that has reached a drained terminal state (Failed,
-/// Completed, or Canceled — not Failing): persist outputs, emit completion
+/// Finalize a proof that has reached a drained result state (`Finalizing`,
+/// `Failed`, or `Canceled` — not `Failing`): persist outputs, publish the
+/// externally visible `Completed` state only after persistence succeeds, emit
 /// metrics, write the report, fire the `completed` lifecycle event, and free
 /// the scheduler slot. Safe to call once a proof has truly drained; idempotent
 /// on missing proofs.
@@ -1473,7 +1520,6 @@ async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
             let mut guard = ps.blocking_lock();
             let mut persisted_proof_path: Option<std::path::PathBuf> = None;
             let mut completed_meta: Option<CompletedProofMeta> = None;
-            let terminal_status_for_log = Some(guard.status.clone());
             if let Some(dir) = state
                 .config
                 .proof
@@ -1499,30 +1545,44 @@ async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
                     }
                 }
             }
-            if let Some(dir) = state.config.proof.persist_final_proofs_dir.as_ref() {
-                match guard.persist_final_proof_to_disk(
-                    dir,
-                    state.config.proof.compress_persisted_final_proofs,
-                ) {
-                    Ok(Some(path)) => {
-                        info!("Persisted final proof {} to {}", proof_uuid, path.display());
-                        persisted_proof_path = Some(path);
-                    }
-                    Ok(None) => {
-                        warn!(
-                            "Proof {} completed without a final proof payload to persist",
-                            proof_uuid
-                        );
+            if matches!(
+                guard.status,
+                ProofStatus::Finalizing | ProofStatus::Completed
+            ) {
+                let persistence_result =
+                    if let Some(dir) = state.config.proof.persist_final_proofs_dir.as_ref() {
+                        guard
+                            .persist_final_proof_to_disk(
+                                dir,
+                                state.config.proof.compress_persisted_final_proofs,
+                            )
+                            .and_then(|path| {
+                                path.ok_or_else(|| {
+                                    eyre::eyre!(
+                                        "proof completed without a final proof payload to persist"
+                                    )
+                                })
+                            })
+                            .map(Some)
+                    } else {
+                        Ok(None)
+                    };
+
+                match persistence_result {
+                    Ok(path) => {
+                        if let Some(path) = path {
+                            info!("Persisted final proof {} to {}", proof_uuid, path.display());
+                            persisted_proof_path = Some(path);
+                        }
+                        guard.status = ProofStatus::Completed;
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to persist final proof {} to {}: {}",
-                            proof_uuid,
-                            dir.display(),
-                            e
-                        );
+                        error!("Failed to persist final proof {}: {}", proof_uuid, e);
+                        guard.status = ProofStatus::Failed(format!("persist final proof: {e}"));
                     }
                 }
+                guard.last_updated = chrono::Utc::now();
+                guard.notify_completion();
             }
             if matches!(guard.status, ProofStatus::Completed) {
                 completed_meta = Some(CompletedProofMeta {
@@ -1556,6 +1616,7 @@ async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
             }
 
             guard.compact_completed_state();
+            let terminal_status_for_log = Some(guard.status.clone());
             (
                 persisted_proof_path,
                 completed_meta,
@@ -2141,6 +2202,21 @@ mod tests {
         Arc::new(AppState::new(config, vec![]))
     }
 
+    fn test_state_with_persistence(dir: PathBuf, compressed: bool) -> Arc<AppState> {
+        let mut state = test_state(dir.clone());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .proof
+            .persist_final_proofs_dir = Some(dir);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .proof
+            .compress_persisted_final_proofs = compressed;
+        state
+    }
+
     #[test]
     fn vk_rel_path_maps_valid_names_to_the_conventional_blob_path() {
         assert_eq!(
@@ -2200,5 +2276,57 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn download_proof_reads_disk_without_in_memory_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof_uuid = "restart-safe-proof";
+        let proof = b"persisted proof bytes";
+        std::fs::write(dir.path().join(format!("{proof_uuid}.proof.bin")), proof).unwrap();
+        let state = test_state_with_persistence(dir.path().to_path_buf(), false);
+        assert!(state.proof_states.is_empty());
+
+        let resp = download_proof(State(state), Path(proof_uuid.to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], proof);
+    }
+
+    #[tokio::test]
+    async fn download_proof_decompresses_disk_without_in_memory_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof_uuid = "compressed-restart-safe-proof";
+        let proof = b"persisted compressed proof bytes";
+        let compressed = zstd::encode_all(&proof[..], 1).unwrap();
+        std::fs::write(dir.path().join(format!("{proof_uuid}.evm.bin")), compressed).unwrap();
+        let state = test_state_with_persistence(dir.path().to_path_buf(), true);
+
+        let resp = download_proof(State(state), Path(proof_uuid.to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], proof);
+    }
+
+    #[tokio::test]
+    async fn download_proof_rejects_ambiguous_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof_uuid = "ambiguous-proof";
+        std::fs::write(dir.path().join(format!("{proof_uuid}.proof.bin")), b"stark").unwrap();
+        std::fs::write(dir.path().join(format!("{proof_uuid}.evm.bin")), b"evm").unwrap();
+        let state = test_state_with_persistence(dir.path().to_path_buf(), false);
+
+        let resp = download_proof(State(state), Path(proof_uuid.to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

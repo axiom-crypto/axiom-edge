@@ -15,9 +15,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::ManagerConfig;
 use crate::handlers::{
-    cancel_proof, download_proof, download_vk, get_loadout, healthz, list_workers, proof_debug,
-    proof_result, proof_state, proof_timeout_watchdog_task, readyz_handler, register_worker,
-    start_proof, upload_input, AppState, PROOF_TIMEOUT_WATCHDOG_INTERVAL,
+    cancel_proof, capabilities, download_proof, download_vk, get_loadout, healthz, list_workers,
+    proof_debug, proof_result, proof_state, proof_timeout_watchdog_task, readyz_handler,
+    register_worker, start_proof, upload_input, AppState, PROOF_TIMEOUT_WATCHDOG_INTERVAL,
 };
 
 /// Run the HTTP server.
@@ -71,6 +71,7 @@ pub async fn run_server(config: ManagerConfig) -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/capabilities", get(capabilities))
         .route("/start_proof", post(start_proof))
         .route("/register_worker", post(register_worker))
         .route("/workers", get(list_workers))

@@ -78,6 +78,9 @@ impl FromStr for InternalProofIndex {
 #[serde(rename_all = "snake_case")]
 pub enum ProofStatus {
     InProgress,
+    /// The proof payload is complete, but manager-side finalization (including
+    /// durable persistence when configured) has not finished yet.
+    Finalizing,
     Completed,
     /// Failure has been declared but workers may still be draining. Holds
     /// the human-readable reason that will surface in the final `Failed`.
@@ -90,6 +93,7 @@ impl ProofStatus {
     pub fn as_str(&self) -> &str {
         match self {
             ProofStatus::InProgress => "in_progress",
+            ProofStatus::Finalizing => "finalizing",
             ProofStatus::Completed => "completed",
             ProofStatus::Failing(_) => "failing",
             ProofStatus::Failed(_) => "failed",
@@ -161,8 +165,8 @@ pub struct ProofState {
     #[serde_as(as = "HashMap<DisplayFromStr, _>")]
     pub internal_proofs: HashMap<InternalProofIndex, InternalProofState>,
 
-    /// EVM (halo2-wrapped) proof artifact. Presence of this field is what
-    /// flips an `Evm`-typed proof to `Completed` (see [`Self::is_completed`]).
+    /// EVM (halo2-wrapped) proof artifact. Presence of this field makes an
+    /// `Evm`-typed proof ready for finalization (see [`Self::is_completed`]).
     #[serde(default)]
     pub evm_proof: Option<EvmProofState>,
 
@@ -293,7 +297,8 @@ impl ProofState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
-            ProofStatus::Completed
+            ProofStatus::Finalizing
+                | ProofStatus::Completed
                 | ProofStatus::Failing(_)
                 | ProofStatus::Failed(_)
                 | ProofStatus::Canceled
@@ -395,7 +400,10 @@ impl ProofState {
     /// decodes the proof bytes) and persistence, which also needs the
     /// deferral merkle-proof bytes to build the on-disk `VmStarkProof`.
     pub fn final_internal_state(&self) -> Option<&InternalProofState> {
-        if !matches!(self.status, ProofStatus::Completed) {
+        if !matches!(
+            self.status,
+            ProofStatus::Finalizing | ProofStatus::Completed
+        ) {
             return None;
         }
 
@@ -416,12 +424,15 @@ impl ProofState {
         proof::decode_proof(bytes).ok()
     }
 
-    /// Get the final EVM (halo2-wrapped) proof bytes if this is an Evm proof
-    /// that has reached [`ProofStatus::Completed`]. Returns the opaque
+    /// Get the final EVM (halo2-wrapped) proof bytes once this Evm proof is
+    /// ready for finalization. Returns the opaque
     /// bincode-encoded wire bytes — consumers decode via `proof::decode_evm_proof`
     /// (kept undecoded here so the manager doesn't pull halo2 deps).
     pub fn get_evm_proof(&self) -> Option<Vec<u8>> {
-        if !matches!(self.status, ProofStatus::Completed) {
+        if !matches!(
+            self.status,
+            ProofStatus::Finalizing | ProofStatus::Completed
+        ) {
             return None;
         }
         self.evm_proof.as_ref()?.proof.clone()
@@ -528,6 +539,8 @@ impl ProofState {
         let age = now - self.last_updated;
         match &self.status {
             ProofStatus::InProgress => age > chrono::Duration::hours(10),
+            // Finalization owns the proof payload while it is being persisted.
+            ProofStatus::Finalizing => false,
             // Failing is transient — drain orchestrator transitions it to
             // Failed (or TTL fires). Don't evict directly from here.
             ProofStatus::Failing(_) => false,
