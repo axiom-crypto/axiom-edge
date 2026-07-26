@@ -54,23 +54,9 @@ class Args:
     total_provers: int
     id_offset: int
     worker_only: bool
-    # Pre-provisioned artifacts mode. When non-empty, this is a directory
-    # exported by an upstream program build, laid out exactly like
-    # `artifacts_path`: programs/{name}/{version}/program.vmexe, plus
-    # deferral/cached_pk for deferral keysets and halo2/halo2_pk for
-    # EVM-ready ones. The loadout and capabilities are derived from that
-    # layout alone (this script reads no metadata files an exporter may ship
-    # alongside); host keygen and vmexe transpilation are SKIPPED (the
-    # exported keyset is deployment-native and must be loaded as-is, never
-    # regenerated), and this dir is mounted as the container artifacts_path.
-    # Empty = normal keygen-from-ELF flow.
+    # Empty selects the normal keygen-from-ELF flow.
     from_artifacts: str
-    # Host directory holding the generic KZG SRS trusted-setup files
-    # (`kzg_bn254_<k>.srs`). For an EVM-ready `--from-artifacts` export the
-    # exporter does NOT bundle these (big + generic); every `kzg_bn254_<k>.srs`
-    # found here is staged next to the exported `halo2_pk` before the workers
-    # mount it (the params reader picks the sizes its key pins; extras are
-    # ignored). Empty unless `--kzg-params-dir` was passed.
+    # Optional source directory for KZG SRS files.
     kzg_params_dir: str
     manager_url_override: str
     worker_host: str
@@ -266,7 +252,7 @@ def parse_args(defaults: dict) -> Args:
             "keygen + transpiling ELFs. DIR must contain "
             "programs/{name}/{version}/program.vmexe for every program, plus "
             "deferral/cached_pk for deferral keysets and halo2/halo2_pk for "
-            "EVM-ready ones. The loadout and capabilities are derived from that "
+            "EVM-ready ones. The loadout and proving modes are derived from that "
             "layout; host keygen and vmexe rebuild are SKIPPED (the exported "
             "keyset is deployment-native and loaded as-is); DIR is mounted as the "
             "container artifacts_path. Mutually exclusive with --programs / "
@@ -294,10 +280,7 @@ def parse_args(defaults: dict) -> Args:
         str(Path(ns.from_artifacts).expanduser().resolve()) if ns.from_artifacts else ""
     )
 
-    # Loadout resolution: from the export's on-disk layout in prebuilt mode,
-    # otherwise
-    # from --programs (required in the normal flow). enable_deferral and the
-    # artifacts_path override are also derived from the export in prebuilt mode.
+    # Prebuilt deployments derive their loadout and proving modes from disk.
     if from_artifacts:
         if ns.programs_input:
             sys.stderr.write(
@@ -305,12 +288,10 @@ def parse_args(defaults: dict) -> Args:
                 "is derived from the export's programs/ layout\n"
             )
             sys.exit(1)
-        (
-            programs,
-            export_evm_ready,
-            prebuilt_deferral,
-            prebuilt_halo2_dir,
-        ) = resolve_prebuilt(from_artifacts)
+        programs, prebuilt_deferral, prebuilt_halo2_dir = resolve_prebuilt(
+            from_artifacts
+        )
+        export_evm_ready = bool(prebuilt_halo2_dir)
     else:
         if not ns.programs_input:
             sys.stderr.write(
@@ -352,11 +333,7 @@ def parse_args(defaults: dict) -> Args:
                 "boots STARK-only)\n"
             )
             sys.exit(1)
-        # EVM-ready export: the shipped halo2 key must be mounted, or the
-        # evm-prove worker's root/halo2 provers can't initialize and /readyz
-        # never goes ready. Auto-configure `--halo2 full` + the exported key dir
-        # so a bare `--from-artifacts <dir>` on an EVM-ready export is ready +
-        # EVM-capable. Explicit --halo2 / --halo2-pk-path override.
+        # Make an EVM-ready export usable without extra flags.
         if export_evm_ready and prebuilt_halo2_dir:
             if not ns.halo2_pk_path:
                 ns.halo2_pk_path = prebuilt_halo2_dir
@@ -446,16 +423,9 @@ def parse_args(defaults: dict) -> Args:
         # halo2 mode drives the two booleans below: full/dedicated build
         # evm-prove; dedicated additionally isolates halo2 on the top-id worker.
         halo2_mode=ns.halo2,
-        # `evm-prove` is forced on in prebuilt mode even for a STARK-only
-        # (evm_ready:false) export. The exporter (lighter) builds openvm-sdk
-        # with `evm-prove`, which turns on `root-prover` and adds the
-        # `root_pk` field to `SdkCachedProvingKey`. That struct is serialized
-        # with bitcode-over-serde (not self-describing), so a consumer built
-        # WITHOUT `root-prover` sees a different field count and fails to
-        # decode `deferral/cached_pk` ("bitcode error"). Building the worker
-        # with `evm-prove` makes the type match; with no halo2 key mounted the
-        # worker still boots STARK-only (`try_load_evm` returns None). See
-        # docs/START_WITH_ARTIFACTS.md.
+        # Prebuilt cached keys were encoded with openvm-sdk's root-prover field,
+        # so their consumers must build with `evm-prove`. Without a Halo2 key,
+        # the worker still boots in STARK-only mode.
         with_evm=ns.halo2 in ("full", "dedicated") or bool(from_artifacts),
         # Prebuilt exports that ship deferral/cached_pk are deferral deployments
         # regardless of the flag; infer it so the worker renders enable_deferral
@@ -534,25 +504,8 @@ def resolve_programs(programs_input: str) -> list[dict]:
     return normalized
 
 
-def resolve_prebuilt(from_artifacts: str) -> tuple[list[dict], bool, bool, str]:
-    """Resolve the loadout + flags from a pre-provisioned export directory.
-
-    Everything is derived from the export's on-disk LAYOUT — the same
-    conventional paths the worker itself loads, so the directory fully
-    describes the deployment:
-
-    - loadout: one program per `programs/{name}/{version}/program.vmexe`
-    - deferral mode: `deferral/cached_pk` present
-    - EVM readiness + halo2 key dir: `halo2/halo2_pk` present
-
-    An exporter may ship extra metadata files in the same directory (its own
-    build records); this script never reads them.
-
-    Returns `(programs, evm_ready, enable_deferral, halo2_dir)`. Each
-    program's `path` is its exported `program.vmexe` (for display + existence
-    checks only — no ELF is transpiled in this mode); `halo2_dir` is the
-    absolute halo2 key dir ("" when the export ships no halo2 key).
-    """
+def resolve_prebuilt(from_artifacts: str) -> tuple[list[dict], bool, str]:
+    """Validate a prebuilt export and derive its loadout and proving modes."""
     base = Path(from_artifacts)
     if not base.is_dir():
         sys.stderr.write(f"--from-artifacts dir does not exist: {from_artifacts}\n")
@@ -579,32 +532,7 @@ def resolve_prebuilt(from_artifacts: str) -> tuple[list[dict], bool, bool, str]:
 
     enable_deferral = (base / "deferral" / "cached_pk").is_file()
     halo2_dir = str(base / "halo2") if (base / "halo2" / "halo2_pk").is_file() else ""
-    evm_ready = bool(halo2_dir)
-    return programs, evm_ready, enable_deferral, halo2_dir
-
-
-def verify_prebuilt_artifacts(args: Args) -> None:
-    """Fail fast if a --from-artifacts dir is missing files the worker loads.
-
-    The worker loads each `program.vmexe` and (in deferral mode) the
-    `deferral/cached_pk` directly from disk — a missing file surfaces as a
-    not-ready worker deep into the boot, so check here where the error is
-    actionable.
-    """
-    base = Path(args.from_artifacts)
-    missing: list[str] = []
-    if args.with_deferral and not (base / "deferral" / "cached_pk").is_file():
-        missing.append(str(base / "deferral" / "cached_pk"))
-    for program in args.programs:
-        if not Path(program["path"]).is_file():
-            missing.append(program["path"])
-    if missing:
-        sys.stderr.write(
-            "--from-artifacts dir is missing required files:\n  "
-            + "\n  ".join(missing)
-            + "\n"
-        )
-        sys.exit(1)
+    return programs, enable_deferral, halo2_dir
 
 
 def provision_prebuilt_halo2_srs(args: Args) -> None:
@@ -1483,7 +1411,6 @@ def main() -> int:
     validate(args)
     if not args.dry_run:
         if args.from_artifacts:
-            verify_prebuilt_artifacts(args)
             provision_prebuilt_halo2_srs(args)
         else:
             validate_program_paths(args.programs)
@@ -1592,9 +1519,7 @@ def main() -> int:
         docker_env.pop("TOOLCHAIN_VERSION", None)
 
     if args.from_artifacts:
-        # Prebuilt mode: no host keygen / vmexe transpilation. The export dir is
-        # the artifacts_path (mounted read-only into every container), loaded
-        # as-is. verify_prebuilt_artifacts already checked the files exist.
+        # Prebuilt mode mounts the validated export without regenerating it.
         print(
             f"Prebuilt artifacts: {args.from_artifacts} (mounted as-is; keygen "
             "and vmexe rebuild skipped)"

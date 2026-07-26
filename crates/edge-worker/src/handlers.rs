@@ -773,17 +773,8 @@ pub async fn handle_sharded_app_prove(
 
     state.active_uploaded_proofs.insert(proof_uuid.clone());
 
-    // The request carries no paths. Reconstruct the deterministic staged
-    // locations from `proof_uuid`: the main input at `input.bin`, and one
-    // `DeferralState` per circuit THIS proof exercises. That per-proof count
-    // comes from the manager (the number of `DeferralState`s it staged +
-    // fanned here) — `0` for a proof that makes no deferred calls (e.g. a leaf
-    // on a deferral deployment), which selects the depth-0 path below. An older
-    // manager that doesn't send the count falls back to the loaded keyset size,
-    // preserving prior behavior.
-    let deferral_state_count = req
-        .num_deferral_circuits
-        .unwrap_or_else(loaded_deferral_circuit_count);
+    // Reconstruct the paths for the inputs staged by the manager.
+    let deferral_state_count = req.num_deferral_circuits;
     let input_path: String = staged_input_path(&proof_uuid)
         .to_string_lossy()
         .into_owned();

@@ -367,7 +367,7 @@ impl ProofState {
     /// - `Evm`   ⇒ the worker's in-process EVM prove has posted the final
     ///   `Evm` artifact (the root proof on its own is only an intermediate
     ///   step, so the final-internal arrival is no longer "done").
-    pub fn is_completed(&self) -> bool {
+    pub fn is_ready_for_finalization(&self) -> bool {
         match self.context.proof_type {
             ProofType::Stark => self.final_internal_proof_present(),
             ProofType::Evm => self
@@ -379,7 +379,7 @@ impl ProofState {
     }
 
     /// Whether the final-internal slot in the recursion tree is occupied.
-    /// Shared helper between `is_completed` (for Stark) and `get_stark_proof`.
+    /// Shared helper for Stark finalization and proof retrieval.
     fn final_internal_proof_present(&self) -> bool {
         if let Some(num_segments) = self.num_segments {
             let num_leaf_proofs = num_segments.div_ceil(self.leaf_arity);
@@ -627,7 +627,7 @@ mod tests {
         assert_eq!(state.context.proof_uuid, "test-proof");
         assert!(matches!(state.status, ProofStatus::InProgress));
         assert_eq!(state.num_segments, None);
-        assert!(!state.is_completed());
+        assert!(!state.is_ready_for_finalization());
     }
 
     #[test]

@@ -118,7 +118,7 @@ impl ProofState {
             ProofResult::Evm(result) => self.handle_halo2_result(result)?,
         };
 
-        if self.is_completed() {
+        if self.is_ready_for_finalization() {
             info!(
                 "Proof {} is ready for finalization",
                 self.context.proof_uuid
@@ -727,8 +727,7 @@ impl ProofState {
             // Final internal proof.
             //
             // `proof_type=Stark`: this is the completion artifact — the
-            // surrounding `is_completed()` check picks it up via the
-            // recursion-tree path and flips status to `Completed`.
+            // shared finalization check picks it up via the recursion tree.
             //
             // `proof_type=Evm`: this is an INTERMEDIATE step. The final-internal
             // worker always runs the tail merge / merkle-prep and submits the
@@ -882,8 +881,7 @@ impl ProofState {
         );
 
         self.evm_proof = Some(result.state);
-        // The shared completion path in handle_proof_result picks up that
-        // is_completed() now returns true and flips status accordingly.
+        // The shared path now sees the final artifact and starts finalization.
         Ok(vec![])
     }
 
@@ -1369,7 +1367,10 @@ mod tests {
             internal_0.state.clone(),
         );
 
-        assert!(!state.is_completed(), "Should not be complete yet");
+        assert!(
+            !state.is_ready_for_finalization(),
+            "Should not be ready yet"
+        );
 
         // Add internal proof at layer 1 (the final layer)
         let internal_1 = InternalProof {
@@ -1394,7 +1395,10 @@ mod tests {
             internal_1.state.clone(),
         );
 
-        assert!(state.is_completed(), "Should be complete now");
+        assert!(
+            state.is_ready_for_finalization(),
+            "Should be ready for finalization"
+        );
         assert!(
             state.get_stark_proof().is_none(),
             "get_stark_proof needs Completed status"
@@ -1701,12 +1705,10 @@ mod tests {
         let context = make_evm_context();
         let mut state = state_with_final_internal(context.clone());
 
-        // For an Evm proof, the final-internal proof being present is NOT
-        // sufficient for is_completed() (only the Evm artifact is). The root
-        // proof is a worker-internal intermediate and is never reported here.
+        // A final-internal proof is only an intermediate for EVM proving.
         assert!(
-            !state.is_completed(),
-            "Evm proof should not complete on the final internal alone"
+            !state.is_ready_for_finalization(),
+            "Evm proof should not finalize on the final internal alone"
         );
         assert!(matches!(state.status, ProofStatus::InProgress));
 
@@ -1724,7 +1726,7 @@ mod tests {
             }))
             .unwrap();
         assert!(matches!(state.status, ProofStatus::Finalizing));
-        assert!(state.is_completed());
+        assert!(state.is_ready_for_finalization());
         assert!(
             state.e2e_latency_ms.is_some(),
             "Completion path should capture e2e latency"
@@ -1736,8 +1738,7 @@ mod tests {
 
     #[test]
     fn stark_proof_still_completes_on_final_internal() {
-        // Stark path must remain unchanged: final-internal arrival flips
-        // is_completed() and the shared path marks Finalizing.
+        // A final-internal STARK proof is ready for finalization.
         let context = make_context();
         let mut state = ProofState::new(context.clone(), 1_000_000, 4, 4, 3, 300);
         state.num_segments = Some(4);
@@ -1949,7 +1950,7 @@ mod tests {
         }
         // The EVM step hasn't run yet — wait for the dedicated worker's Evm.
         assert!(matches!(state.status, ProofStatus::InProgress));
-        assert!(!state.is_completed());
+        assert!(!state.is_ready_for_finalization());
     }
 
     /// Fail-loud invariant: in the unified design every final-internal worker

@@ -286,17 +286,7 @@ fn vk_rel_path(name: &str) -> Option<String> {
     Some(format!("vk/{name}.app_vm_vk.bin"))
 }
 
-/// `GET /vk/{name}` — download a program's verifying-key blob, verbatim.
-///
-/// A `--from-artifacts` deployment's export may include per-program
-/// verifying-key blobs at the conventional `vk/{name}.app_vm_vk.bin` path
-/// inside the mounted artifacts directory. This endpoint serves those files
-/// as raw bytes — the manager never decodes them; what a blob means is
-/// entirely between the exporter and the caller. An aggregation caller
-/// downloads the key for each of its child programs once, to verify child
-/// proofs and frame aggregation jobs. Callers know their own program names.
-/// A deployment whose export ships no such files (e.g. a mock stack) simply
-/// answers `404`.
+/// Download an exported program verifying key without decoding it.
 pub async fn download_vk(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -315,32 +305,28 @@ pub async fn download_vk(
             bytes,
         )
             .into_response(),
-        Err(_) => (
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": format!("no verifying key for program '{name}' on this deployment")
             })),
         )
             .into_response(),
+        Err(e) => {
+            error!("failed to read verifying key for program '{name}': {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to read verifying key"})),
+            )
+                .into_response()
+        }
     }
 }
 
-/// `GET /proof/{proof_uuid}` — download a completed proof's final artifact as
-/// raw, **uncompressed** bytes.
+/// Download an uncompressed final proof from persistent storage.
 ///
-/// Served from the on-disk copy the manager writes at completion
-/// ([`crate::proof_state::persistence`]) — an openvm-codec `VmStarkProof` for a
-/// `Stark` proof, or the raw bincode evm proof for an `Evm` proof. The persisted
-/// directory is the source of truth: lookup deliberately does not consult
-/// `proof_states`, so completed proofs remain downloadable after in-memory
-/// eviction or a manager restart. **Requires `proof.persist_final_proofs_dir`**;
-/// without it this returns `404`.
-///
-/// If the deployment persists compressed (`compress_persisted_final_proofs`),
-/// the bytes are zstd-decoded here so callers always receive the raw payload.
-/// Returns `404` when neither persisted artifact exists, so probing an
-/// in-flight proof is safe. Seeing both artifact kinds for one UUID is an
-/// invariant violation and returns `500`.
+/// Disk is the source of truth, so proofs remain available after in-memory
+/// eviction or restart. Persistence-disabled and missing proofs return 404.
 pub async fn download_proof(
     State(state): State<Arc<AppState>>,
     Path(proof_uuid): Path<String>,
@@ -435,20 +421,6 @@ pub struct StartProofResponse {
 #[derive(serde::Serialize)]
 pub struct HealthzResponse {
     pub status: String,
-}
-
-/// Manager capabilities that affect caller-visible API guarantees.
-#[derive(serde::Serialize)]
-pub struct CapabilitiesResponse {
-    /// Whether completed proofs are durably persisted and available through
-    /// `GET /proof/{proof_uuid}`.
-    pub proof_persistence_enabled: bool,
-}
-
-pub async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(CapabilitiesResponse {
-        proof_persistence_enabled: state.config.proof.persist_final_proofs_dir.is_some(),
-    })
 }
 
 /// Response for manager-controlled worker readiness.
@@ -1092,19 +1064,14 @@ pub async fn start_proof(
     // The `EvmDedicated` worker (if any) is excluded here and owns no shard.
     let mut work_handles = Vec::new();
     for (worker_id, worker) in app_workers {
-        // No input/deferral paths: the worker reconstructs them from
-        // `proof_uuid` (+ its deferral keyset count) and reads the files the
-        // manager staged at those deterministic locations.
+        // The worker reconstructs the staged input paths from `proof_uuid`.
         let work_request = ShardedAppProveRequest {
             proof_uuid: proof_uuid.clone(),
             program: program.clone(),
             prover_id: worker_id,
             num_provers,
             segment_memory: req.segment_memory,
-            // Per-proof deferral count (0 for a no-deferred-calls proof like a
-            // leaf): the worker waits for exactly this many `DeferralState`s
-            // rather than assuming its keyset-wide circuit count.
-            num_deferral_circuits: Some(num_deferral_circuits),
+            num_deferral_circuits,
         };
 
         let client = state.http_client.clone();
@@ -2266,6 +2233,17 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn download_vk_io_error_is_500() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vk/evm-leaf.app_vm_vk.bin")).unwrap();
+        let state = test_state(dir.path().to_path_buf());
+        let resp = download_vk(State(state), Path("evm-leaf".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

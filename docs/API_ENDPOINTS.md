@@ -179,25 +179,6 @@ Return the manager's canonical program loadout (parsed once at startup from `EDG
 
 ---
 
-### GET `/capabilities`
-
-Return manager features that affect client-visible guarantees.
-
-**Response (JSON):**
-
-- **200 OK**:
-```json
-{
-  "proof_persistence_enabled": true
-}
-```
-
-When `true`, `completed` means the final artifact was successfully written to
-the configured persistence directory and is available through
-`GET /proof/{proof_uuid}`.
-
----
-
 ### GET `/workers`
 
 Query the current worker registration status.
