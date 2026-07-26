@@ -602,8 +602,7 @@ Possible proof states:
 
 | Status | Description |
 |--------|-------------|
-| `in_progress` | Proof is currently being generated |
-| `finalizing` | The final artifact exists in memory and manager-side finalization/persistence is running |
+| `in_progress` | Proof generation or configured persistence is still in progress |
 | `completed` | Proof completed successfully; when persistence is enabled, its final artifact is already durable and downloadable |
 | `failing` | A worker reported a fatal error; the manager is draining peer workers before settling into `failed` (transient, non-terminal) |
 | `failed` | Proof failed with error message |

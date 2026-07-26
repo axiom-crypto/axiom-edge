@@ -1,4 +1,4 @@
-//! On-disk persistence for completed proofs and failure snapshots.
+//! On-disk persistence for final proof artifacts and failure snapshots.
 //!
 //! - [`ProofState::persist_final_proof_to_disk`] writes the final STARK
 //!   proof as an openvm-codec `verify_stark::VmStarkProof` (the proof, its
@@ -58,7 +58,7 @@ fn is_leaf_logup_nonzero_root_sum_error(result: &ErrorResult) -> bool {
 }
 
 impl ProofState {
-    /// Persist the completed final proof to disk as bincode, optionally
+    /// Persist the final proof artifact to disk, optionally
     /// zstd-compressed for external upload flows.
     ///
     /// Branches on `context.proof_type`:
@@ -100,7 +100,7 @@ impl ProofState {
         Ok(Some(final_path))
     }
 
-    /// The completed final proof as uncompressed bytes plus the on-disk
+    /// The final proof as uncompressed bytes plus the on-disk
     /// filename suffix, in the encoding disk persistence (and, transitively,
     /// the `/proof/{uuid}` download that reads the persisted file) hands back:
     /// - `Stark` ⇒ (`VmStarkProof` openvm-codec bytes, `"proof.bin"`)
@@ -109,10 +109,7 @@ impl ProofState {
     /// `None` until the proof is ready for finalization and the final artifact
     /// is present.
     fn final_proof_payload(&self) -> Result<Option<(Vec<u8>, &'static str)>> {
-        if !matches!(
-            self.status,
-            ProofStatus::Finalizing | ProofStatus::Completed
-        ) {
+        if !self.is_ready_for_finalization() {
             return Ok(None);
         }
 
@@ -192,8 +189,12 @@ impl ProofState {
                 (bytes, "proof.bin")
             }
             ProofType::Evm => {
-                let evm_bytes = match self.get_evm_proof() {
-                    Some(b) => b,
+                let evm_bytes = match self
+                    .evm_proof
+                    .as_ref()
+                    .and_then(|state| state.proof.clone())
+                {
+                    Some(bytes) => bytes,
                     None => return Ok(None),
                 };
                 (evm_bytes, "evm.bin")

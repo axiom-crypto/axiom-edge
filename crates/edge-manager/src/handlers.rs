@@ -1128,7 +1128,7 @@ pub async fn start_proof(
     //
     // Workers that already accepted will keep proving their shards; their
     // results arrive as "late results" and drop silently via the existing
-    // is_terminal() early-return in the accumulator. Bounded waste.
+    // sealed-result check. Bounded waste.
     if !work_failures.is_empty() {
         let total = work_successes + work_failures.len();
         let base_error = format!(
@@ -1240,14 +1240,14 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
         }
     };
 
-    let (follow_up_requests, transitioned_to_terminal) = match outcome {
+    let (follow_up_requests, sealed_for_results) = match outcome {
         ProofResultEnvelopeOutcome::Late {
             should_log_notice,
             status,
         } => {
             if should_log_notice {
                 debug!(
-                    "Proof {} already terminal ({:?}); dropping late worker results. First late result: worker={}, kind={}",
+                    "Proof {} is sealed ({:?}); dropping late worker results. First late result: worker={}, kind={}",
                     proof_uuid,
                     status,
                     worker_id,
@@ -1278,8 +1278,8 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
         }
         ProofResultEnvelopeOutcome::Processed {
             follow_up_requests,
-            transitioned_to_terminal,
-        } => (follow_up_requests, transitioned_to_terminal),
+            sealed_for_results,
+        } => (follow_up_requests, sealed_for_results),
     };
 
     info!(
@@ -1301,7 +1301,7 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
         }
     }
 
-    if !transitioned_to_terminal {
+    if !sealed_for_results {
         // Mark worker as completed for this result and get any pending work.
         let pending_work = match state
             .state_store
@@ -1324,10 +1324,9 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
         }
     }
 
-    // On the first transition to a *drained* terminal state (Failed/Completed/
-    // Canceled — not Failing), emit metrics and clean up. For Failing proofs,
-    // this fires later on the drain transition via `try_finalize_failing_proof`.
-    if transitioned_to_terminal {
+    // A final artifact seals result accumulation before persistence. Failed
+    // and canceled proofs are also sealed; Failing waits for worker drain.
+    if sealed_for_results {
         let is_failing = {
             let ps = state.proof_states.get(&proof_uuid).map(|s| s.clone());
             match ps {
@@ -1428,7 +1427,7 @@ pub async fn cancel_proof(
     let proof_state = state.proof_states.get(&req.proof_uuid).map(|s| s.clone());
     if let Some(proof_state) = proof_state {
         let mut guard = proof_state.lock().await;
-        if matches!(guard.status, ProofStatus::InProgress) {
+        if matches!(guard.status, ProofStatus::InProgress) && !guard.is_ready_for_finalization() {
             guard.status = ProofStatus::Canceled;
             guard.notify_completion();
         }
@@ -1453,12 +1452,8 @@ struct CompletedProofMeta {
     proving_cycles: Option<u64>,
 }
 
-/// Finalize a proof that has reached a drained result state (`Finalizing`,
-/// `Failed`, or `Canceled` — not `Failing`): persist outputs, publish the
-/// externally visible `Completed` state only after persistence succeeds, emit
-/// metrics, write the report, fire the `completed` lifecycle event, and free
-/// the scheduler slot. Safe to call once a proof has truly drained; idempotent
-/// on missing proofs.
+/// Persist a sealed proof, then publish `Completed`; persistence failures
+/// publish `Failed`. Failed and canceled proofs skip final-proof persistence.
 async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
     // Drop any retained staged bytes for this proof (a deferral proof
     // that terminated before its final-internal JIT dispatch would otherwise
@@ -1512,10 +1507,8 @@ async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
                     }
                 }
             }
-            if matches!(
-                guard.status,
-                ProofStatus::Finalizing | ProofStatus::Completed
-            ) {
+            if matches!(guard.status, ProofStatus::InProgress) && guard.is_ready_for_finalization()
+            {
                 let persistence_result =
                     if let Some(dir) = state.config.proof.persist_final_proofs_dir.as_ref() {
                         guard
@@ -1526,7 +1519,7 @@ async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
                             .and_then(|path| {
                                 path.ok_or_else(|| {
                                     eyre::eyre!(
-                                        "proof completed without a final proof payload to persist"
+                                        "proof ready for finalization without a payload to persist"
                                     )
                                 })
                             })
@@ -2184,6 +2177,23 @@ mod tests {
         state
     }
 
+    fn ready_evm_proof_state(proof_uuid: &str, proof: Vec<u8>) -> ProofState {
+        let mut context = ProofContext::new(
+            proof_uuid.to_string(),
+            ProgramRef::new("test-program", 1),
+            Default::default(),
+        );
+        context.proof_type = protocol::ProofType::Evm;
+        let mut state = ProofState::new(context, 1_000_000, 1, 4, 3, 300);
+        state.evm_proof = Some(protocol::EvmProofState {
+            proof: Some(proof),
+            prove_time_ms: 1,
+            root_prove_time_ms: 1,
+            sub_metrics: Default::default(),
+        });
+        state
+    }
+
     #[test]
     fn vk_rel_path_maps_valid_names_to_the_conventional_blob_path() {
         assert_eq!(
@@ -2306,5 +2316,52 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn finalize_persists_before_publishing_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof_uuid = "persist-before-completed";
+        let proof = b"final evm proof".to_vec();
+        let state = test_state_with_persistence(dir.path().to_path_buf(), false);
+        let proof_state = ready_evm_proof_state(proof_uuid, proof.clone());
+        assert!(matches!(proof_state.status, ProofStatus::InProgress));
+        assert!(proof_state.is_ready_for_finalization());
+        state
+            .proof_states
+            .insert(proof_uuid.to_string(), Arc::new(Mutex::new(proof_state)));
+
+        finalize_proof(&state, proof_uuid).await;
+
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("{proof_uuid}.evm.bin"))).unwrap(),
+            proof
+        );
+        let proof_state = state.proof_states.get(proof_uuid).unwrap().clone();
+        assert!(matches!(
+            proof_state.lock().await.status,
+            ProofStatus::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalize_persistence_failure_publishes_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_path = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_path, b"file").unwrap();
+        let proof_uuid = "persistence-failure";
+        let state = test_state_with_persistence(blocked_path, false);
+        let proof_state = ready_evm_proof_state(proof_uuid, b"proof".to_vec());
+        state
+            .proof_states
+            .insert(proof_uuid.to_string(), Arc::new(Mutex::new(proof_state)));
+
+        finalize_proof(&state, proof_uuid).await;
+
+        let proof_state = state.proof_states.get(proof_uuid).unwrap().clone();
+        assert!(matches!(
+            proof_state.lock().await.status,
+            ProofStatus::Failed(ref reason) if reason.contains("persist final proof")
+        ));
     }
 }

@@ -65,7 +65,7 @@ pub struct ProofConfig {
     #[serde(default = "default_leaf_pack_threshold")]
     pub leaf_pack_threshold: usize,
 
-    /// Optional directory where completed final proofs are persisted as bincode.
+    /// Optional directory for final proof persistence.
     #[serde(default)]
     pub persist_final_proofs_dir: Option<PathBuf>,
 

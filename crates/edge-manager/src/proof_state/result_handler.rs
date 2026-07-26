@@ -28,9 +28,8 @@ use super::state::{InternalProofIndex, ProofState, ProofStatus};
 
 /// Outcome returned by [`ProofState::handle_proof_result_with_envelope_outcome`].
 ///
-/// Lets callers distinguish late results (arrived after the proof reached a
-/// terminal state) from real progress, so they can emit the right metrics and
-/// avoid spamming logs.
+/// Lets callers distinguish results received after accumulation sealed from
+/// real progress.
 pub enum ProofResultEnvelopeOutcome {
     Late {
         should_log_notice: bool,
@@ -38,7 +37,7 @@ pub enum ProofResultEnvelopeOutcome {
     },
     Processed {
         follow_up_requests: Vec<GeneralProveRequest>,
-        transitioned_to_terminal: bool,
+        sealed_for_results: bool,
     },
 }
 
@@ -48,7 +47,7 @@ impl ProofState {
         &mut self,
         envelope: MessageEnvelope<ProofResult>,
     ) -> Result<ProofResultEnvelopeOutcome> {
-        if self.is_terminal() {
+        if self.is_sealed_for_results() {
             let should_log_notice = if self.late_result_notice_emitted {
                 false
             } else {
@@ -65,7 +64,7 @@ impl ProofState {
         let requests = self.handle_proof_result(envelope.message)?;
         Ok(ProofResultEnvelopeOutcome::Processed {
             follow_up_requests: requests,
-            transitioned_to_terminal: self.is_terminal(),
+            sealed_for_results: self.is_sealed_for_results(),
         })
     }
 
@@ -84,7 +83,7 @@ impl ProofState {
 
     /// Handle a proof result.
     pub fn handle_proof_result(&mut self, result: ProofResult) -> Result<Vec<GeneralProveRequest>> {
-        if !matches!(self.status, ProofStatus::InProgress) {
+        if self.is_sealed_for_results() {
             warn!(
                 "Proof {} is not in progress, ignoring result of kind: {}",
                 self.context.proof_uuid,
@@ -123,8 +122,6 @@ impl ProofState {
                 "Proof {} is ready for finalization",
                 self.context.proof_uuid
             );
-            self.status = ProofStatus::Finalizing;
-
             let completion_time = Utc::now();
             let e2e_latency_ms = (completion_time - self.proof_start_time).num_milliseconds();
             self.e2e_latency_ms = if e2e_latency_ms >= 0 {
@@ -1144,7 +1141,7 @@ mod envelope_outcome_tests {
     }
 
     #[test]
-    fn error_result_reports_terminal_transition_once() {
+    fn error_result_seals_result_accumulation() {
         let context = make_context();
         let mut state = ProofState::new(context.clone(), 1_000_000, 4, 4, 3, 300);
 
@@ -1157,7 +1154,7 @@ mod envelope_outcome_tests {
         assert!(matches!(
             outcome,
             ProofResultEnvelopeOutcome::Processed {
-                transitioned_to_terminal: true,
+                sealed_for_results: true,
                 ..
             }
         ));
@@ -1701,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn evm_proof_completes_on_evm_result_not_final_internal() {
+    fn evm_proof_becomes_ready_on_evm_result_not_final_internal() {
         let context = make_evm_context();
         let mut state = state_with_final_internal(context.clone());
 
@@ -1713,31 +1710,66 @@ mod tests {
         assert!(matches!(state.status, ProofStatus::InProgress));
 
         // The Evm result arrives (the only result the worker posts for the EVM
-        // step): flip to Finalizing via the shared completion path.
-        state
-            .handle_proof_result(ProofResult::Evm(protocol::EvmProof {
-                context: context.clone(),
-                state: protocol::EvmProofState {
-                    proof: Some(vec![1u8; 128]),
-                    prove_time_ms: 20,
-                    root_prove_time_ms: 7,
-                    sub_metrics: HashMap::new(),
-                },
-            }))
+        // step): seal result accumulation while persistence runs.
+        let outcome = state
+            .handle_proof_result_with_envelope_outcome(MessageEnvelope::with_metadata(
+                ProofResult::Evm(protocol::EvmProof {
+                    context: context.clone(),
+                    state: protocol::EvmProofState {
+                        proof: Some(vec![1u8; 128]),
+                        prove_time_ms: 20,
+                        root_prove_time_ms: 7,
+                        sub_metrics: HashMap::new(),
+                    },
+                }),
+            ))
             .unwrap();
-        assert!(matches!(state.status, ProofStatus::Finalizing));
+        assert!(matches!(
+            outcome,
+            ProofResultEnvelopeOutcome::Processed {
+                sealed_for_results: true,
+                ..
+            }
+        ));
+        assert!(matches!(state.status, ProofStatus::InProgress));
         assert!(state.is_ready_for_finalization());
         assert!(
             state.e2e_latency_ms.is_some(),
-            "Completion path should capture e2e latency"
+            "Final-artifact path should capture e2e latency"
         );
 
-        let evm_bytes = state.get_evm_proof().expect("evm proof bytes available");
+        let late = state
+            .handle_proof_result_with_envelope_outcome(MessageEnvelope::with_metadata(
+                ProofResult::Evm(protocol::EvmProof {
+                    context,
+                    state: protocol::EvmProofState {
+                        proof: Some(vec![2u8; 128]),
+                        prove_time_ms: 21,
+                        root_prove_time_ms: 8,
+                        sub_metrics: HashMap::new(),
+                    },
+                }),
+            ))
+            .unwrap();
+        assert!(matches!(
+            late,
+            ProofResultEnvelopeOutcome::Late {
+                status: ProofStatus::InProgress,
+                ..
+            }
+        ));
+
+        let evm_bytes = state
+            .evm_proof
+            .as_ref()
+            .and_then(|proof| proof.proof.clone())
+            .expect("evm proof bytes stored");
         assert_eq!(evm_bytes, vec![1u8; 128]);
+        assert!(state.get_evm_proof().is_none());
     }
 
     #[test]
-    fn stark_proof_still_completes_on_final_internal() {
+    fn stark_proof_becomes_ready_on_final_internal() {
         // A final-internal STARK proof is ready for finalization.
         let context = make_context();
         let mut state = ProofState::new(context.clone(), 1_000_000, 4, 4, 3, 300);
@@ -1778,8 +1810,9 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(matches!(state.status, ProofStatus::Finalizing));
-        assert!(state.get_stark_proof().is_some());
+        assert!(matches!(state.status, ProofStatus::InProgress));
+        assert!(state.is_ready_for_finalization());
+        assert!(state.get_stark_proof().is_none());
         assert!(
             state.get_evm_proof().is_none(),
             "Stark proof has no evm artifact"
@@ -1886,9 +1919,17 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(matches!(state.status, ProofStatus::Finalizing));
-        let evm = state.get_evm_proof().expect("evm proof present");
-        assert_eq!(evm.len(), 4096);
+        assert!(matches!(state.status, ProofStatus::InProgress));
+        assert!(state.is_ready_for_finalization());
+        assert_eq!(
+            state
+                .evm_proof
+                .as_ref()
+                .and_then(|proof| proof.proof.as_ref())
+                .map(Vec::len),
+            Some(4096)
+        );
+        assert!(state.get_evm_proof().is_none());
         assert!(state.e2e_latency_ms.is_some());
 
         // The EVM-tail timing is surfaced on `/proof_state` (root=30, halo2=50
