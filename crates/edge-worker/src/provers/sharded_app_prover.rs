@@ -821,7 +821,7 @@ mod real_impl {
             let metered =
                 executor_keepalive.metered_instance(exe.as_ref(), &executor_idx_to_air_idx)?;
             #[cfg(feature = "rvr")]
-            let metered = executor_keepalive.metered_segment_rvr_instance(
+            let metered = executor_keepalive.metered_segment_instance(
                 exe.as_ref(),
                 &executor_idx_to_air_idx,
                 temp_prover.vm.num_airs(),
@@ -932,6 +932,11 @@ mod real_impl {
         );
 
         let exe = instances.exe.as_ref();
+        // Preflight interpreter for per-segment proving (feat/rvr-preflight:
+        // `vm.prove` was replaced by `vm.prove_segment(&interpreter, &program, ..)`).
+        // Owned/self-contained, so it can be held across the loop while `vm` is
+        // borrowed mutably per segment.
+        let interpreter = app_prover.vm.preflight_interpreter(exe)?;
         let vm_config = &instances.vm_config;
         let execution_instances = instances.execution_instances.clone();
         let metered_ctx = build_metered_ctx(app_prover, exe, job.segment_memory);
@@ -1082,11 +1087,11 @@ mod real_impl {
             // *values* but not the touched-page metadata a sequential preflight
             // would carry, so rebuild it from the image before proving.
             vm_state.memory.memory.recompute_touched_pages();
-            let prove_result = app_prover.vm.prove(
-                &mut app_prover.interpreter,
+            let prove_result = app_prover.vm.prove_segment(
+                &interpreter,
+                &exe.program,
                 vm_state,
-                Some(prove_data.segment.num_insns),
-                &prove_data.segment.trace_heights,
+                prove_data.segment.num_insns,
             );
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
@@ -1268,6 +1273,16 @@ mod real_impl {
     ) -> ProverResult {
         let vm_config = &instances.vm_config;
         let pure_interpreter = &instances.execution_instances.pure;
+        let exe = instances.exe.as_ref();
+        // Preflight interpreter for per-segment proving (see prove_segment below).
+        let interpreter = match app_prover.vm.preflight_interpreter(exe) {
+            Ok(i) => i,
+            Err(e) => {
+                return consumer_failure(format!(
+                    "Failed to build preflight interpreter: {e}"
+                ))
+            }
+        };
         let mut results = Vec::new();
 
         for prove_data in prove_rx.iter() {
@@ -1299,11 +1314,11 @@ mod real_impl {
             // *values* but not the touched-page metadata a sequential preflight
             // would carry, so rebuild it from the image before proving.
             vm_state.memory.memory.recompute_touched_pages();
-            let prove_result = app_prover.vm.prove(
-                &mut app_prover.interpreter,
+            let prove_result = app_prover.vm.prove_segment(
+                &interpreter,
+                &exe.program,
                 vm_state,
-                Some(prove_data.segment.num_insns),
-                &prove_data.segment.trace_heights,
+                prove_data.segment.num_insns,
             );
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
@@ -1517,6 +1532,11 @@ mod real_impl {
         let is_deferral_job = !job.deferral_state_paths.is_empty();
 
         let exe = instances.exe.as_ref();
+        // Preflight interpreter for per-segment proving (feat/rvr-preflight:
+        // `vm.prove` was replaced by `vm.prove_segment(&interpreter, &program, ..)`).
+        // Owned/self-contained, so it can be held across the loop while `vm` is
+        // borrowed mutably per segment.
+        let interpreter = app_prover.vm.preflight_interpreter(exe)?;
         let vm_config = &instances.vm_config;
         let execution_instances = instances.execution_instances.clone();
 
@@ -1664,11 +1684,11 @@ mod real_impl {
             // *values* but not the touched-page metadata a sequential preflight
             // would carry, so rebuild it from the image before proving.
             vm_state.memory.memory.recompute_touched_pages();
-            let prove_result = app_prover.vm.prove(
-                &mut app_prover.interpreter,
+            let prove_result = app_prover.vm.prove_segment(
+                &interpreter,
+                &exe.program,
                 vm_state,
-                Some(prove_data.segment.num_insns),
-                &prove_data.segment.trace_heights,
+                prove_data.segment.num_insns,
             );
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
