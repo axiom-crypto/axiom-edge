@@ -118,17 +118,21 @@ openvm-stark-backend = { git = "https://github.com/openvm-org/stark-backend.git"
 openvm-cuda-backend = { git = "https://github.com/openvm-org/stark-backend.git", branch = "develop-v2.1.0", default-features = false }
 openvm-cuda-common = { git = "https://github.com/openvm-org/stark-backend.git", branch = "develop-v2.1.0", default-features = false }
 
-# OpenVM, pinned to the develop-v2.1.0 branch. stark-backend above is kept on
-# the same branch so the single `links = "cuda-common"` source is shared.
-sdk-v2 = { package = "openvm-sdk", git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.1.0", default-features = false }
-continuations-v2 = { package = "openvm-continuations", git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.1.0", default-features = false }
-openvm-sdk-config = { git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.1.0", default-features = false }
-verify-stark = { package = "openvm-verify-stark-host", git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.1.0", default-features = false }
+# OpenVM. Temporarily pinned to the `fix/projective-affine-api` branch — an
+# unmerged branch on top of `develop-v2.1.0` (it still carries the
+# recompute-touched-pages + rvr `!= 0` fixes). Revert to `branch =
+# "develop-v2.1.0"` once it merges. stark-backend above stays on
+# `develop-v2.1.0` (the branch's own dep ref), so the single
+# `links = "cuda-common"` source is still shared.
+sdk-v2 = { package = "openvm-sdk", git = "https://github.com/openvm-org/openvm.git", branch = "fix/projective-affine-api", default-features = false }
+continuations-v2 = { package = "openvm-continuations", git = "https://github.com/openvm-org/openvm.git", branch = "fix/projective-affine-api", default-features = false }
+openvm-sdk-config = { git = "https://github.com/openvm-org/openvm.git", branch = "fix/projective-affine-api", default-features = false }
+verify-stark = { package = "openvm-verify-stark-host", git = "https://github.com/openvm-org/openvm.git", branch = "fix/projective-affine-api", default-features = false }
 # Test-only dep for the deferral self-recursion e2e in
 # `edge-integration-tests`: `get_deferral_state` / `get_raw_deferral_results`
 # for caller-side input prep, mirroring the openvm
 # `tests::test_verify_stark_deferral` harness. Not used outside tests.
-openvm-verify-stark-circuit = { git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.1.0", default-features = false }
+openvm-verify-stark-circuit = { git = "https://github.com/openvm-org/openvm.git", branch = "fix/projective-affine-api", default-features = false }
 
 # Testing
 tempfile = "3.13.0"
