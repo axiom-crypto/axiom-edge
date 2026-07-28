@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -53,6 +54,10 @@ class Args:
     total_provers: int
     id_offset: int
     worker_only: bool
+    # Empty selects the normal keygen-from-ELF flow.
+    from_artifacts: str
+    # Optional source directory for KZG SRS files.
+    kzg_params_dir: str
     manager_url_override: str
     worker_host: str
     worker_port_base: int
@@ -233,10 +238,36 @@ def parse_args(defaults: dict) -> Args:
                         "consumer (e.g. a reporter sidecar) to translate.")
     p.add_argument(
         "--programs", dest="programs_input", default="", metavar="JSON_OR_PATH",
-        required=True,
         help=(
-            "Required. Program loadout as JSON list of {name, version, path} "
-            "objects, or a path to a JSON file with the same shape."
+            "Program loadout as JSON list of {name, version, path} objects, or a "
+            "path to a JSON file with the same shape. Required for the normal "
+            "keygen-from-ELF flow; omit it when using --from-artifacts (the "
+            "loadout is derived from the export's programs/ layout instead)."
+        ),
+    )
+    p.add_argument(
+        "--from-artifacts", dest="from_artifacts", default="", metavar="DIR",
+        help=(
+            "Boot from a pre-provisioned artifacts directory instead of running "
+            "keygen + transpiling ELFs. DIR must contain "
+            "programs/{name}/{version}/program.vmexe for every program, plus "
+            "deferral/cached_pk for deferral keysets and halo2/halo2_pk for "
+            "EVM-ready ones. The loadout and proving modes are derived from that "
+            "layout; host keygen and vmexe rebuild are SKIPPED (the exported "
+            "keyset is deployment-native and loaded as-is); DIR is mounted as the "
+            "container artifacts_path. Mutually exclusive with --programs / "
+            "--regenerate."
+        ),
+    )
+    p.add_argument(
+        "--kzg-params-dir", dest="kzg_params_dir", default="", metavar="DIR",
+        help=(
+            "Directory holding the generic KZG SRS files (`kzg_bn254_<k>.srs`). "
+            "Needed with an EVM-ready --from-artifacts export: the exporter does "
+            "not bundle SRS (generic trusted setup), so every kzg_bn254_<k>.srs "
+            "found here is staged alongside the exported halo2_pk (the worker "
+            "picks the sizes its key pins; extras are ignored). Not needed if "
+            "the SRS files are already next to halo2_pk."
         ),
     )
 
@@ -245,7 +276,69 @@ def parse_args(defaults: dict) -> Args:
     num_gpus = ns.num_gpus if ns.num_gpus is not None else 4
     total_provers = ns.total_provers if ns.total_provers is not None else num_gpus
 
-    programs = resolve_programs(ns.programs_input)
+    from_artifacts = (
+        str(Path(ns.from_artifacts).expanduser().resolve()) if ns.from_artifacts else ""
+    )
+
+    # Prebuilt deployments derive their loadout and proving modes from disk.
+    if from_artifacts:
+        if ns.programs_input:
+            sys.stderr.write(
+                "--programs cannot be combined with --from-artifacts: the loadout "
+                "is derived from the export's programs/ layout\n"
+            )
+            sys.exit(1)
+        programs, prebuilt_deferral, prebuilt_halo2_dir = resolve_prebuilt(
+            from_artifacts
+        )
+        export_evm_ready = bool(prebuilt_halo2_dir)
+    else:
+        if not ns.programs_input:
+            sys.stderr.write(
+                "--programs is required (or pass --from-artifacts to boot from a "
+                "pre-provisioned export directory)\n"
+            )
+            sys.exit(1)
+        programs = resolve_programs(ns.programs_input)
+        export_evm_ready = None
+        prebuilt_deferral = False
+        prebuilt_halo2_dir = ""
+
+    kzg_params_dir = (
+        str(Path(ns.kzg_params_dir).expanduser().resolve()) if ns.kzg_params_dir else ""
+    )
+
+    if from_artifacts:
+        if ns.force_regenerate:
+            sys.stderr.write(
+                "--regenerate cannot be combined with --from-artifacts: the "
+                "exported keyset is deployment-native and is loaded as-is, never "
+                "regenerated\n"
+            )
+            sys.exit(1)
+        if not export_evm_ready and ns.halo2 != "none":
+            sys.stderr.write(
+                f"--halo2 {ns.halo2} requested but the export ships no halo2 key "
+                "(no halo2/halo2_pk — STARK-only: no root/halo2 material was "
+                "exported). The worker is still built with evm-prove so it can "
+                "decode the exported cached_pk, but it boots STARK-only. Drop "
+                "--halo2, or provision an evm-ready export + --halo2-pk-path\n"
+            )
+            sys.exit(1)
+        if not export_evm_ready and ns.halo2_pk_path:
+            sys.stderr.write(
+                "--halo2-pk-path given but the export ships no halo2 key "
+                "(no halo2/halo2_pk): the exported keyset has no halo2/root material, "
+                "so a halo2 key can't match it. Drop --halo2-pk-path (the worker "
+                "boots STARK-only)\n"
+            )
+            sys.exit(1)
+        # Make an EVM-ready export usable without extra flags.
+        if export_evm_ready and prebuilt_halo2_dir:
+            if not ns.halo2_pk_path:
+                ns.halo2_pk_path = prebuilt_halo2_dir
+            if ns.halo2 == "none":
+                ns.halo2 = "full"
 
     def required(section: str, key: str):
         try:
@@ -275,6 +368,8 @@ def parse_args(defaults: dict) -> Args:
         total_provers=total_provers,
         id_offset=ns.id_offset,
         worker_only=ns.worker_only,
+        from_artifacts=from_artifacts,
+        kzg_params_dir=kzg_params_dir,
         manager_url_override=ns.manager_url_override,
         worker_host=ns.worker_host,
         worker_port_base=ns.worker_port_base,
@@ -313,7 +408,9 @@ def parse_args(defaults: dict) -> Args:
         manager_listen_addr=required("server", "manager_listen_addr"),
         worker_listen_addr=required("server", "worker_listen_addr"),
         log_level=required("telemetry", "log_level"),
-        artifacts_path=required("paths", "artifacts_path"),
+        # In prebuilt mode the export dir IS the artifacts_path (mounted as-is);
+        # otherwise use the configured host dir keygen writes into.
+        artifacts_path=from_artifacts or required("paths", "artifacts_path"),
         # halo2_pk_path: optional, CLI-only. defaults.toml has no entry —
         # stark-only deployments leave it unset.
         halo2_pk_path=(
@@ -326,8 +423,14 @@ def parse_args(defaults: dict) -> Args:
         # halo2 mode drives the two booleans below: full/dedicated build
         # evm-prove; dedicated additionally isolates halo2 on the top-id worker.
         halo2_mode=ns.halo2,
-        with_evm=ns.halo2 in ("full", "dedicated"),
-        with_deferral=ns.with_deferral,
+        # Prebuilt cached keys were encoded with openvm-sdk's root-prover field,
+        # so their consumers must build with `evm-prove`. Without a Halo2 key,
+        # the worker still boots in STARK-only mode.
+        with_evm=ns.halo2 in ("full", "dedicated") or bool(from_artifacts),
+        # Prebuilt exports that ship deferral/cached_pk are deferral deployments
+        # regardless of the flag; infer it so the worker renders enable_deferral
+        # and loads the cached keyset.
+        with_deferral=ns.with_deferral or prebuilt_deferral,
         dedicated_halo2_gpu=ns.halo2 == "dedicated",
     )
 
@@ -399,6 +502,87 @@ def resolve_programs(programs_input: str) -> list[dict]:
         normalized.append({"name": name, "version": version, "path": path})
 
     return normalized
+
+
+def resolve_prebuilt(from_artifacts: str) -> tuple[list[dict], bool, str]:
+    """Validate a prebuilt export and derive its loadout and proving modes."""
+    base = Path(from_artifacts)
+    if not base.is_dir():
+        sys.stderr.write(f"--from-artifacts dir does not exist: {from_artifacts}\n")
+        sys.exit(1)
+
+    programs: list[dict] = []
+    for vmexe in sorted(base.glob("programs/*/*/program.vmexe")):
+        version_dir = vmexe.parent
+        name = version_dir.parent.name
+        try:
+            version = int(version_dir.name)
+        except ValueError:
+            sys.stderr.write(
+                f"{version_dir}: program version dir must be an integer "
+                "(layout is programs/{name}/{version}/program.vmexe)\n"
+            )
+            sys.exit(1)
+        programs.append({"name": name, "version": version, "path": str(vmexe)})
+    if not programs:
+        sys.stderr.write(
+            f"--from-artifacts dir has no programs/*/*/program.vmexe: {base}\n"
+        )
+        sys.exit(1)
+
+    enable_deferral = (base / "deferral" / "cached_pk").is_file()
+    halo2_dir = str(base / "halo2") if (base / "halo2" / "halo2_pk").is_file() else ""
+    return programs, enable_deferral, halo2_dir
+
+
+def provision_prebuilt_halo2_srs(args: Args) -> None:
+    """Place the KZG SRS an EVM-ready export needs next to its `halo2_pk`.
+
+    The exporter ships `halo2_pk` but NOT the generic multi-GB KZG SRS
+    (`kzg_bn254_<k>.srs`) — shared trusted setup, provisioned per host. The
+    worker's params reader resolves the sizes its halo2 key pins from the same
+    dir as `halo2_pk` (the mounted `halo2_pk_path`), so the SRS files must sit
+    beside it. Every `kzg_bn254_<k>.srs` found in `--kzg-params-dir` is staged
+    (the reader picks what its key pins; extras are ignored): files already
+    present are left as-is; missing ones are hardlinked (instant, no extra
+    space on the same filesystem; copy fallback across filesystems).
+
+    Without `--kzg-params-dir`, at least one SRS file must already sit next to
+    `halo2_pk` — otherwise the root/halo2 provers would fail to initialize
+    deep into the boot, so fail fast here instead.
+    """
+    if not (args.from_artifacts and args.halo2_pk_path):
+        return
+    halo2_dir = Path(args.halo2_pk_path)
+    if not args.kzg_params_dir:
+        if not list(halo2_dir.glob("kzg_bn254_*.srs")):
+            sys.stderr.write(
+                f"EVM-ready export needs KZG SRS (kzg_bn254_<k>.srs) alongside "
+                f"{halo2_dir / 'halo2_pk'}, but none are present and "
+                f"--kzg-params-dir was not given (SRS are generic trusted "
+                f"setup, not bundled in the export)\n"
+            )
+            sys.exit(1)
+        return
+    src_dir = Path(args.kzg_params_dir)
+    srs_files = sorted(p.name for p in src_dir.glob("kzg_bn254_*.srs"))
+    if not srs_files:
+        sys.stderr.write(
+            f"--kzg-params-dir has no kzg_bn254_<k>.srs files: {src_dir}\n"
+        )
+        sys.exit(1)
+    missing = [f for f in srs_files if not (halo2_dir / f).is_file()]
+    if not missing:
+        print(f"KZG SRS already present in {halo2_dir}")
+        return
+    for name in missing:
+        src = src_dir / name
+        dst = halo2_dir / name
+        try:
+            os.link(src, dst)  # hardlink: instant, no extra space (same fs)
+        except OSError:
+            shutil.copyfile(src, dst)  # cross-filesystem fallback
+        print(f"  Provisioned KZG SRS {dst} <- {src}")
 
 
 def validate_program_paths(programs: list[dict]) -> None:
@@ -720,6 +904,13 @@ def print_banner(
     print(f"  Manager URL:          {eff['manager_url']}")
     for extra in args.extra_compose_files:
         print(f"  Extra compose file:   {extra}")
+    if args.from_artifacts:
+        print(f"  Prebuilt artifacts:   {args.from_artifacts} (keygen skipped)")
+        # evm-prove is forced on so the worker's SdkCachedProvingKey type
+        # matches the exporter's (root-prover field). With no halo2 key the
+        # worker still boots STARK-only.
+        if args.halo2_mode == "none":
+            print("  Prebuilt build:       evm-prove (to match exporter); boots STARK-only (no halo2 key)")
     print(f"  Force regenerate:     {str(args.force_regenerate).lower()}")
     print(f"  App provers/worker:   {args.app_provers}")
     print(f"  halo2 mode:           {args.halo2_mode}")
@@ -1219,7 +1410,10 @@ def main() -> int:
     args = parse_args(defaults)
     validate(args)
     if not args.dry_run:
-        validate_program_paths(args.programs)
+        if args.from_artifacts:
+            provision_prebuilt_halo2_srs(args)
+        else:
+            validate_program_paths(args.programs)
 
     if not args.worker_host:
         sys.stderr.write("Auto-detecting private IP for worker registration...\n")
@@ -1324,13 +1518,24 @@ def main() -> int:
     else:
         docker_env.pop("TOOLCHAIN_VERSION", None)
 
-    # Keygen (builds convert_fixtures host-side and runs it).
-    did_keygen = ensure_artifacts(args, eff["features"], eff["toolchain"], build_workspace)
-    if did_keygen:
+    if args.from_artifacts:
+        # Prebuilt mode mounts the validated export without regenerating it.
         print(
-            "Artifacts changed on disk; forcing container recreation so workers "
-            "reload program.vmexe and keys."
+            f"Prebuilt artifacts: {args.from_artifacts} (mounted as-is; keygen "
+            "and vmexe rebuild skipped)"
         )
+        for program in args.programs:
+            print(f"    {program['name']} v{program['version']} <- {program['path']}")
+        print()
+        did_keygen = False
+    else:
+        # Keygen (builds convert_fixtures host-side and runs it).
+        did_keygen = ensure_artifacts(args, eff["features"], eff["toolchain"], build_workspace)
+        if did_keygen:
+            print(
+                "Artifacts changed on disk; forcing container recreation so workers "
+                "reload program.vmexe and keys."
+            )
 
     # Build + up from the repository root. Compose files live under docker/,
     # and their relative volume paths are resolved from that directory.

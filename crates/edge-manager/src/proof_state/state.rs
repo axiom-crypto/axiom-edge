@@ -104,7 +104,7 @@ impl ProofStatus {
 /// results arrive. The behavior is split across sibling modules:
 /// - [`super::result_handler`] handles incoming results and emits follow-up requests
 /// - [`super::recursion`] computes recursion-tree shape (pure)
-/// - [`super::persistence`] writes completed proofs / failure snapshots to disk
+/// - [`super::persistence`] writes final proofs / failure snapshots to disk
 /// - [`super::metrics_report`] generates the per-proof report and OTel metrics
 #[serde_as]
 #[derive(Serialize, Deserialize, Clone)]
@@ -161,8 +161,8 @@ pub struct ProofState {
     #[serde_as(as = "HashMap<DisplayFromStr, _>")]
     pub internal_proofs: HashMap<InternalProofIndex, InternalProofState>,
 
-    /// EVM (halo2-wrapped) proof artifact. Presence of this field is what
-    /// flips an `Evm`-typed proof to `Completed` (see [`Self::is_completed`]).
+    /// EVM (halo2-wrapped) proof artifact. Presence of this field makes an
+    /// `Evm`-typed proof ready for persistence and completion.
     #[serde(default)]
     pub evm_proof: Option<EvmProofState>,
 
@@ -282,28 +282,22 @@ impl ProofState {
         self.completion_notifier.clone()
     }
 
-    /// Notify waiters that the proof is complete.
+    /// Notify status waiters after a completion or failure transition.
     pub fn notify_completion(&self) {
         self.completion_notifier.notify_waiters();
     }
 
-    /// Whether the proof has reached a terminal state from the accumulator's
-    /// perspective — incoming results are dropped. Includes `Failing`, which
-    /// is awaiting worker drain but no longer accepts recursion-tree updates.
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.status,
-            ProofStatus::Completed
-                | ProofStatus::Failing(_)
-                | ProofStatus::Failed(_)
-                | ProofStatus::Canceled
-        )
+    /// Whether result accumulation is sealed.
+    ///
+    /// A final artifact seals the proof before persistence without changing
+    /// its externally visible status from `InProgress`.
+    pub fn is_sealed_for_results(&self) -> bool {
+        !matches!(self.status, ProofStatus::InProgress) || self.is_ready_for_finalization()
     }
 
-    /// Whether the watchdog should mark this proof as timed out: still
-    /// in-progress and past its `timeout_secs` deadline.
+    /// Whether an unsealed proof has exceeded its timeout.
     pub fn is_timed_out(&self, now: DateTime<Utc>) -> bool {
-        if self.is_terminal() {
+        if self.is_sealed_for_results() {
             return false;
         }
         let elapsed = (now - self.proof_start_time).num_seconds();
@@ -312,9 +306,9 @@ impl ProofState {
 
     /// Mark this proof as timed out. Sets `Failing` (not terminal yet —
     /// awaits worker drain). Records `last_error_result` so failure-snapshot
-    /// persistence still gates correctly. Idempotent on terminal states.
+    /// persistence still gates correctly. No-op once result accumulation seals.
     pub fn mark_timed_out(&mut self) {
-        if self.is_terminal() {
+        if self.is_sealed_for_results() {
             return;
         }
         let reason = format!("timed out after {}s", self.timeout_secs);
@@ -330,9 +324,9 @@ impl ProofState {
 
     /// Mark this proof as failing with the given reason. Transient state —
     /// the manager will transition to `Failed` once workers drain (or TTL).
-    /// No-op on already-terminal proofs.
+    /// No-op once result accumulation seals.
     pub fn mark_failing(&mut self, reason: String) {
-        if self.is_terminal() {
+        if self.is_sealed_for_results() {
             return;
         }
         let error = ErrorResult {
@@ -362,7 +356,7 @@ impl ProofState {
     /// - `Evm`   ⇒ the worker's in-process EVM prove has posted the final
     ///   `Evm` artifact (the root proof on its own is only an intermediate
     ///   step, so the final-internal arrival is no longer "done").
-    pub fn is_completed(&self) -> bool {
+    pub fn is_ready_for_finalization(&self) -> bool {
         match self.context.proof_type {
             ProofType::Stark => self.final_internal_proof_present(),
             ProofType::Evm => self
@@ -374,7 +368,7 @@ impl ProofState {
     }
 
     /// Whether the final-internal slot in the recursion tree is occupied.
-    /// Shared helper between `is_completed` (for Stark) and `get_stark_proof`.
+    /// Shared helper for Stark finalization and proof retrieval.
     fn final_internal_proof_present(&self) -> bool {
         if let Some(num_segments) = self.num_segments {
             let num_leaf_proofs = num_segments.div_ceil(self.leaf_arity);
@@ -389,16 +383,8 @@ impl ProofState {
         false
     }
 
-    /// The final internal proof's state — the completion artifact for a
-    /// `proof_type=Stark` proof — if the proof has completed and the slot is
-    /// occupied. Shared by [`get_stark_proof`](Self::get_stark_proof) (which
-    /// decodes the proof bytes) and persistence, which also needs the
-    /// deferral merkle-proof bytes to build the on-disk `VmStarkProof`.
+    /// The final internal proof slot, if occupied.
     pub fn final_internal_state(&self) -> Option<&InternalProofState> {
-        if !matches!(self.status, ProofStatus::Completed) {
-            return None;
-        }
-
         let num_segments = self.num_segments?;
         let num_leaf_proofs = num_segments.div_ceil(self.leaf_arity);
         let num_internal_layers =
@@ -412,14 +398,14 @@ impl ProofState {
 
     /// Get the final STARK proof if completed (decoded from wire bytes).
     pub fn get_stark_proof(&self) -> Option<ProofWithPublicValue<F>> {
+        if !matches!(self.status, ProofStatus::Completed) {
+            return None;
+        }
         let bytes = self.final_internal_state()?.proof.as_ref()?;
         proof::decode_proof(bytes).ok()
     }
 
-    /// Get the final EVM (halo2-wrapped) proof bytes if this is an Evm proof
-    /// that has reached [`ProofStatus::Completed`]. Returns the opaque
-    /// bincode-encoded wire bytes — consumers decode via `proof::decode_evm_proof`
-    /// (kept undecoded here so the manager doesn't pull halo2 deps).
+    /// Get the completed EVM proof bytes.
     pub fn get_evm_proof(&self) -> Option<Vec<u8>> {
         if !matches!(self.status, ProofStatus::Completed) {
             return None;
@@ -527,7 +513,9 @@ impl ProofState {
     pub fn should_evict(&self, now: DateTime<Utc>) -> bool {
         let age = now - self.last_updated;
         match &self.status {
-            ProofStatus::InProgress => age > chrono::Duration::hours(10),
+            ProofStatus::InProgress => {
+                !self.is_ready_for_finalization() && age > chrono::Duration::hours(10)
+            }
             // Failing is transient — drain orchestrator transitions it to
             // Failed (or TTL fires). Don't evict directly from here.
             ProofStatus::Failing(_) => false,
@@ -614,7 +602,7 @@ mod tests {
         assert_eq!(state.context.proof_uuid, "test-proof");
         assert!(matches!(state.status, ProofStatus::InProgress));
         assert_eq!(state.num_segments, None);
-        assert!(!state.is_completed());
+        assert!(!state.is_ready_for_finalization());
     }
 
     #[test]

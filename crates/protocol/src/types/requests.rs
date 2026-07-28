@@ -260,12 +260,8 @@ pub struct LoadoutResponse {
 pub struct ShardedAppProveRequest {
     pub proof_uuid: String,
     pub program: ProgramRef,
-    // Note: no input/deferral paths and no labels here. The worker reads its
-    // input (and any `DeferralState`s) from the deterministic staged paths it
-    // reconstructs from `proof_uuid` + its loaded deferral keyset — the manager
-    // fanned those files out to the same deterministic locations. Labels live on
-    // the manager's ProofContext (lifecycle events + metrics). Workers only
-    // need (proof_uuid, program, shard) to prove.
+    // The worker reconstructs input paths from `proof_uuid`; labels remain on
+    // the manager's ProofContext.
     /// Worker ID (0-indexed).
     pub prover_id: usize,
     /// Total number of workers.
@@ -273,6 +269,9 @@ pub struct ShardedAppProveRequest {
     /// Optional override for OPENVM_MAX_SEGMENT_MEMORY.
     #[serde(default)]
     pub segment_memory: Option<usize>,
+    /// Number of `DeferralState`s staged for this proof; zero selects the
+    /// no-deferred-calls path even when the loaded keyset supports deferral.
+    pub num_deferral_circuits: usize,
 }
 
 /// Leaf prove request — aggregate a batch of app proofs into a leaf proof.
@@ -575,13 +574,13 @@ mod tests {
 
     #[test]
     fn sharded_app_prove_request_carries_no_paths() {
-        // The request carries no input/deferral paths — the worker reconstructs
-        // the deterministic staged paths from `proof_uuid` (+ its keyset count).
+        // The worker reconstructs staged paths from the proof UUID.
         let json = serde_json::json!({
             "proof_uuid": "proof-x",
             "program": {"name": "p", "version": 1},
             "prover_id": 0,
             "num_provers": 1,
+            "num_deferral_circuits": 0,
         });
         let req: super::ShardedAppProveRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.proof_uuid, "proof-x");

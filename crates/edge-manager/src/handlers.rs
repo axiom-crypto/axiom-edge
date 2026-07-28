@@ -3,7 +3,7 @@
 use axum::{
     body::Bytes,
     extract::{Multipart, Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -89,6 +89,12 @@ pub struct AppState {
     /// (main + deferral states) and the final-internal JIT dispatch
     /// (deferral inputs). See [`StagedInputs`].
     pub staged_inputs: DashMap<String, StagedInputs>,
+    /// Root of the artifacts export mounted into the container (from
+    /// `server.artifacts_path`, defaulting to the standard `--from-artifacts`
+    /// mount `/data/artifacts`). `GET /vk/{name}` serves per-program
+    /// verifying-key blobs verbatim from its `vk/` subdir; the manager never
+    /// reads or interprets anything else in it.
+    pub artifacts_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -98,6 +104,14 @@ impl AppState {
             EdgeWorkerRegistry::new(config.server.num_workers, config.provers.clone());
         let state_store = EdgeStateStore::new(config.provers.max_leaf_provers);
         let programs_set: HashSet<ProgramRef> = programs.iter().cloned().collect();
+        // Root of the mounted artifacts export, served by `GET /vk/{name}`.
+        // Defaults to the standard `--from-artifacts` container mount when the
+        // config leaves `artifacts_path` unset.
+        let artifacts_path = config
+            .server
+            .artifacts_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/data/artifacts"));
         Self {
             config,
             worker_registry,
@@ -122,6 +136,7 @@ impl AppState {
             programs,
             programs_set,
             staged_inputs: DashMap::new(),
+            artifacts_path,
         }
     }
 }
@@ -250,6 +265,149 @@ pub async fn upload_input(
         proof_uuid, has_main, n_states, n_inputs
     );
     (StatusCode::OK, "Input staged".to_string())
+}
+
+/// The relative path of a program's verifying-key blob inside the mounted
+/// artifacts export, or `None` when `name` is not an acceptable program name.
+///
+/// Names are restricted to non-empty ASCII `[A-Za-z0-9._-]` with no `..`
+/// substring. Axum single-segment path params can never contain `/`, but the
+/// name becomes a filesystem path component, so it is validated here anyway
+/// (belt and braces against traversal).
+fn vk_rel_path(name: &str) -> Option<String> {
+    if name.is_empty()
+        || name.contains("..")
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(format!("vk/{name}.app_vm_vk.bin"))
+}
+
+/// Download an exported program verifying key without decoding it.
+pub async fn download_vk(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(rel) = vk_rel_path(&name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid program name"})),
+        )
+            .into_response();
+    };
+    match tokio::fs::read(state.artifacts_path.join(rel)).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no verifying key for program '{name}' on this deployment")
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            error!("failed to read verifying key for program '{name}': {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to read verifying key"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Download an uncompressed final proof from persistent storage.
+///
+/// Disk is the source of truth, so proofs remain available after in-memory
+/// eviction or restart. Persistence-disabled and missing proofs return 404.
+pub async fn download_proof(
+    State(state): State<Arc<AppState>>,
+    Path(proof_uuid): Path<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_manager_proof_uuid(&proof_uuid) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid proof_uuid: {reason}"),
+        )
+            .into_response();
+    }
+    let Some(dir) = state.config.proof.persist_final_proofs_dir.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "proof persistence is disabled".to_string(),
+        )
+            .into_response();
+    };
+    let stark_path = dir.join(format!("{proof_uuid}.proof.bin"));
+    let evm_path = dir.join(format!("{proof_uuid}.evm.bin"));
+    let (stark_exists, evm_exists) = match tokio::try_join!(
+        tokio::fs::try_exists(&stark_path),
+        tokio::fs::try_exists(&evm_path)
+    ) {
+        Ok(exists) => exists,
+        Err(e) => {
+            error!("failed to inspect persisted proof paths for {proof_uuid}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("inspect persisted proof: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let path = match (stark_exists, evm_exists) {
+        (true, false) => stark_path,
+        (false, true) => evm_path,
+        (false, false) => {
+            return (StatusCode::NOT_FOUND, "proof not found".to_string()).into_response();
+        }
+        (true, true) => {
+            error!("both STARK and EVM persisted artifacts exist for {proof_uuid}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "multiple persisted proof artifacts found".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    // Read (and, if the deployment compresses persisted proofs, decompress) off
+    // the async executor — proofs can be multi-MB and zstd decode is CPU-bound.
+    let compressed = state.config.proof.compress_persisted_final_proofs;
+    let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        let bytes = std::fs::read(&path)?;
+        if compressed {
+            zstd::decode_all(&bytes[..])
+        } else {
+            Ok(bytes)
+        }
+    })
+    .await;
+    match read {
+        Ok(Ok(bytes)) => (StatusCode::OK, bytes).into_response(),
+        Ok(Err(e)) => {
+            error!("failed to read persisted proof for {proof_uuid}: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read persisted proof: {e}"),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!("persisted-proof read task failed for {proof_uuid}: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read task failed: {e}"),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Response for start_proof endpoint.
@@ -538,7 +696,10 @@ pub async fn start_proof(
         );
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Another proof is already running"})),
+            Json(serde_json::json!({
+                "error": "deployment_busy",
+                "message": "Another proof is already running",
+            })),
         );
     }
 
@@ -547,7 +708,10 @@ pub async fn start_proof(
         error!("Proof {} already exists", req.proof_uuid);
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Proof already exists"})),
+            Json(serde_json::json!({
+                "error": "proof_already_exists",
+                "message": "Proof already exists",
+            })),
         );
     }
 
@@ -900,15 +1064,14 @@ pub async fn start_proof(
     // The `EvmDedicated` worker (if any) is excluded here and owns no shard.
     let mut work_handles = Vec::new();
     for (worker_id, worker) in app_workers {
-        // No input/deferral paths: the worker reconstructs them from
-        // `proof_uuid` (+ its deferral keyset count) and reads the files the
-        // manager staged at those deterministic locations.
+        // The worker reconstructs the staged input paths from `proof_uuid`.
         let work_request = ShardedAppProveRequest {
             proof_uuid: proof_uuid.clone(),
             program: program.clone(),
             prover_id: worker_id,
             num_provers,
             segment_memory: req.segment_memory,
+            num_deferral_circuits,
         };
 
         let client = state.http_client.clone();
@@ -965,7 +1128,7 @@ pub async fn start_proof(
     //
     // Workers that already accepted will keep proving their shards; their
     // results arrive as "late results" and drop silently via the existing
-    // is_terminal() early-return in the accumulator. Bounded waste.
+    // sealed-result check. Bounded waste.
     if !work_failures.is_empty() {
         let total = work_successes + work_failures.len();
         let base_error = format!(
@@ -1077,14 +1240,14 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
         }
     };
 
-    let (follow_up_requests, transitioned_to_terminal) = match outcome {
+    let (follow_up_requests, sealed_for_results) = match outcome {
         ProofResultEnvelopeOutcome::Late {
             should_log_notice,
             status,
         } => {
             if should_log_notice {
                 debug!(
-                    "Proof {} already terminal ({:?}); dropping late worker results. First late result: worker={}, kind={}",
+                    "Proof {} is sealed ({:?}); dropping late worker results. First late result: worker={}, kind={}",
                     proof_uuid,
                     status,
                     worker_id,
@@ -1115,8 +1278,8 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
         }
         ProofResultEnvelopeOutcome::Processed {
             follow_up_requests,
-            transitioned_to_terminal,
-        } => (follow_up_requests, transitioned_to_terminal),
+            sealed_for_results,
+        } => (follow_up_requests, sealed_for_results),
     };
 
     info!(
@@ -1138,7 +1301,7 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
         }
     }
 
-    if !transitioned_to_terminal {
+    if !sealed_for_results {
         // Mark worker as completed for this result and get any pending work.
         let pending_work = match state
             .state_store
@@ -1161,10 +1324,9 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
         }
     }
 
-    // On the first transition to a *drained* terminal state (Failed/Completed/
-    // Canceled — not Failing), emit metrics and clean up. For Failing proofs,
-    // this fires later on the drain transition via `try_finalize_failing_proof`.
-    if transitioned_to_terminal {
+    // A final artifact seals result accumulation before persistence. Failed
+    // and canceled proofs are also sealed; Failing waits for worker drain.
+    if sealed_for_results {
         let is_failing = {
             let ps = state.proof_states.get(&proof_uuid).map(|s| s.clone());
             match ps {
@@ -1265,7 +1427,7 @@ pub async fn cancel_proof(
     let proof_state = state.proof_states.get(&req.proof_uuid).map(|s| s.clone());
     if let Some(proof_state) = proof_state {
         let mut guard = proof_state.lock().await;
-        if matches!(guard.status, ProofStatus::InProgress) {
+        if matches!(guard.status, ProofStatus::InProgress) && !guard.is_ready_for_finalization() {
             guard.status = ProofStatus::Canceled;
             guard.notify_completion();
         }
@@ -1290,11 +1452,8 @@ struct CompletedProofMeta {
     proving_cycles: Option<u64>,
 }
 
-/// Finalize a proof that has reached a drained terminal state (Failed,
-/// Completed, or Canceled — not Failing): persist outputs, emit completion
-/// metrics, write the report, fire the `completed` lifecycle event, and free
-/// the scheduler slot. Safe to call once a proof has truly drained; idempotent
-/// on missing proofs.
+/// Persist a sealed proof, then publish `Completed`; persistence failures
+/// publish `Failed`. Failed and canceled proofs skip final-proof persistence.
 async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
     // Drop any retained staged bytes for this proof (a deferral proof
     // that terminated before its final-internal JIT dispatch would otherwise
@@ -1323,7 +1482,6 @@ async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
             let mut guard = ps.blocking_lock();
             let mut persisted_proof_path: Option<std::path::PathBuf> = None;
             let mut completed_meta: Option<CompletedProofMeta> = None;
-            let terminal_status_for_log = Some(guard.status.clone());
             if let Some(dir) = state
                 .config
                 .proof
@@ -1349,30 +1507,42 @@ async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
                     }
                 }
             }
-            if let Some(dir) = state.config.proof.persist_final_proofs_dir.as_ref() {
-                match guard.persist_final_proof_to_disk(
-                    dir,
-                    state.config.proof.compress_persisted_final_proofs,
-                ) {
-                    Ok(Some(path)) => {
-                        info!("Persisted final proof {} to {}", proof_uuid, path.display());
-                        persisted_proof_path = Some(path);
-                    }
-                    Ok(None) => {
-                        warn!(
-                            "Proof {} completed without a final proof payload to persist",
-                            proof_uuid
-                        );
+            if matches!(guard.status, ProofStatus::InProgress) && guard.is_ready_for_finalization()
+            {
+                let persistence_result =
+                    if let Some(dir) = state.config.proof.persist_final_proofs_dir.as_ref() {
+                        guard
+                            .persist_final_proof_to_disk(
+                                dir,
+                                state.config.proof.compress_persisted_final_proofs,
+                            )
+                            .and_then(|path| {
+                                path.ok_or_else(|| {
+                                    eyre::eyre!(
+                                        "proof ready for finalization without a payload to persist"
+                                    )
+                                })
+                            })
+                            .map(Some)
+                    } else {
+                        Ok(None)
+                    };
+
+                match persistence_result {
+                    Ok(path) => {
+                        if let Some(path) = path {
+                            info!("Persisted final proof {} to {}", proof_uuid, path.display());
+                            persisted_proof_path = Some(path);
+                        }
+                        guard.status = ProofStatus::Completed;
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to persist final proof {} to {}: {}",
-                            proof_uuid,
-                            dir.display(),
-                            e
-                        );
+                        error!("Failed to persist final proof {}: {}", proof_uuid, e);
+                        guard.status = ProofStatus::Failed(format!("persist final proof: {e}"));
                     }
                 }
+                guard.last_updated = chrono::Utc::now();
+                guard.notify_completion();
             }
             if matches!(guard.status, ProofStatus::Completed) {
                 completed_meta = Some(CompletedProofMeta {
@@ -1406,6 +1576,7 @@ async fn finalize_proof(state: &Arc<AppState>, proof_uuid: &str) {
             }
 
             guard.compact_completed_state();
+            let terminal_status_for_log = Some(guard.status.clone());
             (
                 persisted_proof_path,
                 completed_meta,
@@ -1961,4 +2132,236 @@ async fn abort_proof_with_failure(
             "proof_uuid": proof_uuid,
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        LifecycleConfig, MetricsConfig, ProofConfig, ProversConfig, ServerConfig, TelemetryConfig,
+    };
+    use std::path::PathBuf;
+
+    fn test_state(artifacts_path: PathBuf) -> Arc<AppState> {
+        let config = ManagerConfig {
+            server: ServerConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                num_workers: 1,
+                artifacts_path: Some(artifacts_path),
+            },
+            proof: ProofConfig::default(),
+            provers: ProversConfig {
+                max_app_provers: 1,
+                max_leaf_provers: 1,
+                max_internal_provers: 1,
+            },
+            lifecycle: LifecycleConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            metrics: MetricsConfig::default(),
+        };
+        Arc::new(AppState::new(config, vec![]))
+    }
+
+    fn test_state_with_persistence(dir: PathBuf, compressed: bool) -> Arc<AppState> {
+        let mut state = test_state(dir.clone());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .proof
+            .persist_final_proofs_dir = Some(dir);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .proof
+            .compress_persisted_final_proofs = compressed;
+        state
+    }
+
+    fn ready_evm_proof_state(proof_uuid: &str, proof: Vec<u8>) -> ProofState {
+        let mut context = ProofContext::new(
+            proof_uuid.to_string(),
+            ProgramRef::new("test-program", 1),
+            Default::default(),
+        );
+        context.proof_type = protocol::ProofType::Evm;
+        let mut state = ProofState::new(context, 1_000_000, 1, 4, 3, 300);
+        state.evm_proof = Some(protocol::EvmProofState {
+            proof: Some(proof),
+            prove_time_ms: 1,
+            root_prove_time_ms: 1,
+            sub_metrics: Default::default(),
+        });
+        state
+    }
+
+    #[test]
+    fn vk_rel_path_maps_valid_names_to_the_conventional_blob_path() {
+        assert_eq!(
+            vk_rel_path("evm-leaf").as_deref(),
+            Some("vk/evm-leaf.app_vm_vk.bin")
+        );
+        assert_eq!(
+            vk_rel_path("prog_1.v2").as_deref(),
+            Some("vk/prog_1.v2.app_vm_vk.bin")
+        );
+    }
+
+    #[test]
+    fn vk_rel_path_rejects_bad_names() {
+        for bad in ["", "..", "a..b", "a/b", "a\\b", "a b", "naïve", "a\0b"] {
+            assert_eq!(vk_rel_path(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn download_vk_serves_an_existing_blob_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("vk")).unwrap();
+        let blob: &[u8] = b"opaque vk bytes \x00\x01\x02";
+        std::fs::write(dir.path().join("vk/evm-leaf.app_vm_vk.bin"), blob).unwrap();
+        let state = test_state(dir.path().to_path_buf());
+
+        let resp = download_vk(State(state), Path("evm-leaf".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], blob);
+    }
+
+    #[tokio::test]
+    async fn download_vk_missing_file_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf());
+        let resp = download_vk(State(state), Path("evm-leaf".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn download_vk_io_error_is_500() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vk/evm-leaf.app_vm_vk.bin")).unwrap();
+        let state = test_state(dir.path().to_path_buf());
+        let resp = download_vk(State(state), Path("evm-leaf".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn download_vk_invalid_name_is_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf());
+        let resp = download_vk(State(state), Path("..".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn download_proof_reads_disk_without_in_memory_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof_uuid = "restart-safe-proof";
+        let proof = b"persisted proof bytes";
+        std::fs::write(dir.path().join(format!("{proof_uuid}.proof.bin")), proof).unwrap();
+        let state = test_state_with_persistence(dir.path().to_path_buf(), false);
+        assert!(state.proof_states.is_empty());
+
+        let resp = download_proof(State(state), Path(proof_uuid.to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], proof);
+    }
+
+    #[tokio::test]
+    async fn download_proof_decompresses_disk_without_in_memory_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof_uuid = "compressed-restart-safe-proof";
+        let proof = b"persisted compressed proof bytes";
+        let compressed = zstd::encode_all(&proof[..], 1).unwrap();
+        std::fs::write(dir.path().join(format!("{proof_uuid}.evm.bin")), compressed).unwrap();
+        let state = test_state_with_persistence(dir.path().to_path_buf(), true);
+
+        let resp = download_proof(State(state), Path(proof_uuid.to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], proof);
+    }
+
+    #[tokio::test]
+    async fn download_proof_rejects_ambiguous_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof_uuid = "ambiguous-proof";
+        std::fs::write(dir.path().join(format!("{proof_uuid}.proof.bin")), b"stark").unwrap();
+        std::fs::write(dir.path().join(format!("{proof_uuid}.evm.bin")), b"evm").unwrap();
+        let state = test_state_with_persistence(dir.path().to_path_buf(), false);
+
+        let resp = download_proof(State(state), Path(proof_uuid.to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn finalize_persists_before_publishing_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let proof_uuid = "persist-before-completed";
+        let proof = b"final evm proof".to_vec();
+        let state = test_state_with_persistence(dir.path().to_path_buf(), false);
+        let proof_state = ready_evm_proof_state(proof_uuid, proof.clone());
+        assert!(matches!(proof_state.status, ProofStatus::InProgress));
+        assert!(proof_state.is_ready_for_finalization());
+        state
+            .proof_states
+            .insert(proof_uuid.to_string(), Arc::new(Mutex::new(proof_state)));
+
+        finalize_proof(&state, proof_uuid).await;
+
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("{proof_uuid}.evm.bin"))).unwrap(),
+            proof
+        );
+        let proof_state = state.proof_states.get(proof_uuid).unwrap().clone();
+        assert!(matches!(
+            proof_state.lock().await.status,
+            ProofStatus::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalize_persistence_failure_publishes_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_path = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_path, b"file").unwrap();
+        let proof_uuid = "persistence-failure";
+        let state = test_state_with_persistence(blocked_path, false);
+        let proof_state = ready_evm_proof_state(proof_uuid, b"proof".to_vec());
+        state
+            .proof_states
+            .insert(proof_uuid.to_string(), Arc::new(Mutex::new(proof_state)));
+
+        finalize_proof(&state, proof_uuid).await;
+
+        let proof_state = state.proof_states.get(proof_uuid).unwrap().clone();
+        assert!(matches!(
+            proof_state.lock().await.status,
+            ProofStatus::Failed(ref reason) if reason.contains("persist final proof")
+        ));
+    }
 }

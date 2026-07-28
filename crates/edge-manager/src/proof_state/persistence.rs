@@ -1,4 +1,4 @@
-//! On-disk persistence for completed proofs and failure snapshots.
+//! On-disk persistence for final proof artifacts and failure snapshots.
 //!
 //! - [`ProofState::persist_final_proof_to_disk`] writes the final STARK
 //!   proof as an openvm-codec `verify_stark::VmStarkProof` (the proof, its
@@ -58,7 +58,7 @@ fn is_leaf_logup_nonzero_root_sum_error(result: &ErrorResult) -> bool {
 }
 
 impl ProofState {
-    /// Persist the completed final proof to disk as bincode, optionally
+    /// Persist the final proof artifact to disk, optionally
     /// zstd-compressed for external upload flows.
     ///
     /// Branches on `context.proof_type`:
@@ -75,12 +75,42 @@ impl ProofState {
         output_dir: &Path,
         compress: bool,
     ) -> Result<Option<PathBuf>> {
-        if !matches!(self.status, ProofStatus::Completed) {
-            return Ok(None);
-        }
-
         if let Some(path) = &self.persisted_final_proof_path {
             return Ok(Some(PathBuf::from(path)));
+        }
+
+        let Some((bytes, suffix)) = self.final_proof_payload()? else {
+            return Ok(None);
+        };
+
+        std::fs::create_dir_all(output_dir)?;
+
+        let final_path = output_dir.join(format!("{}.{}", self.context.proof_uuid, suffix));
+        let temp_path = output_dir.join(format!("{}.{}.tmp", self.context.proof_uuid, suffix));
+        let bytes = if compress {
+            zstd::encode_all(&bytes[..], FINAL_PROOF_ZSTD_LEVEL)?
+        } else {
+            bytes
+        };
+
+        std::fs::write(&temp_path, bytes)?;
+        std::fs::rename(&temp_path, &final_path)?;
+
+        self.persisted_final_proof_path = Some(final_path.display().to_string());
+        Ok(Some(final_path))
+    }
+
+    /// The final proof as uncompressed bytes plus the on-disk
+    /// filename suffix, in the encoding disk persistence (and, transitively,
+    /// the `/proof/{uuid}` download that reads the persisted file) hands back:
+    /// - `Stark` ⇒ (`VmStarkProof` openvm-codec bytes, `"proof.bin"`)
+    /// - `Evm`   ⇒ (raw bincode evm proof bytes, `"evm.bin"`)
+    ///
+    /// `None` until the proof is ready for finalization and the final artifact
+    /// is present.
+    fn final_proof_payload(&self) -> Result<Option<(Vec<u8>, &'static str)>> {
+        if !self.is_ready_for_finalization() {
+            return Ok(None);
         }
 
         let (bytes, suffix) = match self.context.proof_type {
@@ -159,29 +189,19 @@ impl ProofState {
                 (bytes, "proof.bin")
             }
             ProofType::Evm => {
-                let evm_bytes = match self.get_evm_proof() {
-                    Some(b) => b,
+                let evm_bytes = match self
+                    .evm_proof
+                    .as_ref()
+                    .and_then(|state| state.proof.clone())
+                {
+                    Some(bytes) => bytes,
                     None => return Ok(None),
                 };
                 (evm_bytes, "evm.bin")
             }
         };
 
-        std::fs::create_dir_all(output_dir)?;
-
-        let final_path = output_dir.join(format!("{}.{}", self.context.proof_uuid, suffix));
-        let temp_path = output_dir.join(format!("{}.{}.tmp", self.context.proof_uuid, suffix));
-        let bytes = if compress {
-            zstd::encode_all(&bytes[..], FINAL_PROOF_ZSTD_LEVEL)?
-        } else {
-            bytes
-        };
-
-        std::fs::write(&temp_path, bytes)?;
-        std::fs::rename(&temp_path, &final_path)?;
-
-        self.persisted_final_proof_path = Some(final_path.display().to_string());
-        Ok(Some(final_path))
+        Ok(Some((bytes, suffix)))
     }
 
     fn should_persist_leaf_failure_app_proofs(&self) -> bool {
