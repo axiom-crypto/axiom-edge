@@ -254,7 +254,7 @@ mod real_impl {
     use super::*;
     use crate::artifacts::ArtifactStore;
     use crossbeam::channel::bounded;
-    use openvm_sdk_config::SdkVmConfig;
+    use openvm_sdk_config::{SdkVmConfig, SegmentProver};
     use proof::ProofWithPublicValue;
     use protocol::{AppProof, AppProofState, ExecuteE2Result, ExecuteE2State};
     use sdk_v2::openvm_circuit::arch::{
@@ -453,8 +453,44 @@ mod real_impl {
         openvm_stark_backend::Val<sdk_v2::SC>,
     >;
 
-    /// Type alias for the prover instance type returned by new_local_prover
-    pub type ProverType = VmInstance<RecursionEngine, SdkVmBuilder>;
+    /// Fixed-program prover: the GPU `VmInstance` plus a `SegmentProver`
+    /// prepared once at construction. Under cuda+rvr `SegmentProver` resolves to
+    /// `openvm_sdk_config::preflight_driver::SegmentProver`, which uploads the
+    /// guest program to the device once and runs the native rvr preflight per
+    /// segment (no per-segment upload, no interpreter). Held in
+    /// `Option<ProverType>` on each app worker thread, swapped on program change.
+    pub struct ProverType {
+        segment_prover: SegmentProver,
+        instance: VmInstance<RecursionEngine, SdkVmBuilder>,
+    }
+
+    impl ProverType {
+        fn new(instance: VmInstance<RecursionEngine, SdkVmBuilder>) -> Result<Self> {
+            let segment_prover = SegmentProver::new(&instance)?;
+            Ok(Self {
+                segment_prover,
+                instance,
+            })
+        }
+
+        /// Prove one segment from its (fast-forwarded) start state via the
+        /// standalone `SegmentProver`. Returns the segment proof and, on
+        /// successful termination, the final memory.
+        fn prove_segment(
+            &mut self,
+            state: VmState<GuestMemory>,
+            segment: &Segment,
+        ) -> std::result::Result<
+            (
+                openvm_stark_backend::proof::Proof<sdk_v2::SC>,
+                Option<GuestMemory>,
+            ),
+            sdk_v2::openvm_circuit::arch::VirtualMachineError,
+        > {
+            self.segment_prover
+                .prove(&mut self.instance, state, segment)
+        }
+    }
 
     // Execution instance types for segment discovery (metered) and
     // fast-forwarding to a segment start (pure).
@@ -663,6 +699,7 @@ mod real_impl {
         segment_memory: Option<usize>,
     ) -> MeteredCtx {
         let mut metered_ctx = app_prover
+            .instance
             .vm
             .build_metered_ctx(exe)
             .with_suspend_on_segment(true);
@@ -821,7 +858,7 @@ mod real_impl {
             let metered =
                 executor_keepalive.metered_instance(exe.as_ref(), &executor_idx_to_air_idx)?;
             #[cfg(feature = "rvr")]
-            let metered = executor_keepalive.metered_segment_rvr_instance(
+            let metered = executor_keepalive.metered_segment_instance(
                 exe.as_ref(),
                 &executor_idx_to_air_idx,
                 temp_prover.vm.num_airs(),
@@ -868,8 +905,9 @@ mod real_impl {
         exe: Arc<VmExeType>,
     ) -> Result<ProverType> {
         let start = Instant::now();
-        let prover =
+        let instance =
             new_local_prover::<RecursionEngine, _>(SdkVmBuilder {}, &app_pk.app_vm_pk, exe)?;
+        let prover = ProverType::new(instance)?;
         info!(
             "build_gpu_prover[{program}] took {}ms",
             start.elapsed().as_millis()
@@ -1082,12 +1120,7 @@ mod real_impl {
             // *values* but not the touched-page metadata a sequential preflight
             // would carry, so rebuild it from the image before proving.
             vm_state.memory.memory.recompute_touched_pages();
-            let prove_result = app_prover.vm.prove(
-                &mut app_prover.interpreter,
-                vm_state,
-                Some(prove_data.segment.num_insns),
-                &prove_data.segment.trace_heights,
-            );
+            let prove_result = app_prover.prove_segment(vm_state, &prove_data.segment);
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
                 Err(e) => {
@@ -1123,7 +1156,7 @@ mod real_impl {
                     }
                 };
                 let top_tree =
-                    match app_prover.vm.memory_top_tree().ok_or_else(|| {
+                    match app_prover.instance.vm.memory_top_tree().ok_or_else(|| {
                         eyre::eyre!("Memory top tree should exist for terminal segment")
                     }) {
                         Ok(t) => t,
@@ -1299,12 +1332,7 @@ mod real_impl {
             // *values* but not the touched-page metadata a sequential preflight
             // would carry, so rebuild it from the image before proving.
             vm_state.memory.memory.recompute_touched_pages();
-            let prove_result = app_prover.vm.prove(
-                &mut app_prover.interpreter,
-                vm_state,
-                Some(prove_data.segment.num_insns),
-                &prove_data.segment.trace_heights,
-            );
+            let prove_result = app_prover.prove_segment(vm_state, &prove_data.segment);
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
                 Err(e) => {
@@ -1334,7 +1362,7 @@ mod real_impl {
                         ));
                     }
                 };
-                let top_tree = match app_prover.vm.memory_top_tree() {
+                let top_tree = match app_prover.instance.vm.memory_top_tree() {
                     Some(t) => t,
                     None => {
                         return consumer_failure(format!(
@@ -1664,12 +1692,7 @@ mod real_impl {
             // *values* but not the touched-page metadata a sequential preflight
             // would carry, so rebuild it from the image before proving.
             vm_state.memory.memory.recompute_touched_pages();
-            let prove_result = app_prover.vm.prove(
-                &mut app_prover.interpreter,
-                vm_state,
-                Some(prove_data.segment.num_insns),
-                &prove_data.segment.trace_heights,
-            );
+            let prove_result = app_prover.prove_segment(vm_state, &prove_data.segment);
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
                 Err(e) => {
@@ -1702,7 +1725,7 @@ mod real_impl {
                     }
                 };
                 let top_tree =
-                    match app_prover.vm.memory_top_tree().ok_or_else(|| {
+                    match app_prover.instance.vm.memory_top_tree().ok_or_else(|| {
                         eyre::eyre!("Memory top tree should exist for terminal segment")
                     }) {
                         Ok(t) => t,
