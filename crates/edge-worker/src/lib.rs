@@ -8,6 +8,7 @@ pub mod config;
 #[cfg(not(feature = "mock-provers"))]
 pub mod deferral_merkle;
 pub mod handlers;
+pub mod keyset_manifest;
 #[cfg(not(feature = "mock-provers"))]
 pub mod openvm_config;
 pub mod prover_pool;

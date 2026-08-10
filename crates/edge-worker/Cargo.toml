@@ -31,6 +31,13 @@ path = "src/bin/halo2_keygen.rs"
 required-features = ["evm-prove"]
 
 [[bin]]
+name = "emit_manifest"
+path = "src/bin/emit_manifest.rs"
+# Real-prover binary (gated on `not(mock-provers)` in source): reconstructs the
+# on-disk keyset to derive the family commits. evm_ready/halo2 fields need
+# `evm-prove`; absent it the emitted manifest is stark-only (`evm_ready=false`).
+
+[[bin]]
 name = "verify_edge_final_proof"
 path = "src/bin/verify_edge_final_proof.rs"
 
@@ -83,6 +90,7 @@ bitcode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+sha2 = "0.10"
 
 # Utilities
 chrono = { workspace = true }
