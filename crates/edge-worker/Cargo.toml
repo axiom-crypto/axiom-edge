@@ -34,8 +34,9 @@ required-features = ["evm-prove"]
 name = "emit_manifest"
 path = "src/bin/emit_manifest.rs"
 # Real-prover binary (gated on `not(mock-provers)` in source): reconstructs the
-# on-disk keyset to derive the family commits. evm_ready/halo2 fields need
-# `evm-prove`; absent it the emitted manifest is stark-only (`evm_ready=false`).
+# on-disk keyset to derive each program's app_exe_commit, then writes the
+# loadout roster + keyset_epoch as keyset-manifest.json. Stark-only; no
+# evm-prove dependency.
 
 [[bin]]
 name = "verify_edge_final_proof"

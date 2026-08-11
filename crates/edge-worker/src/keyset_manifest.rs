@@ -1,183 +1,148 @@
-//! The keyset manifest a keygen host emits to report what it derived.
+//! The keyset manifest a keygen host emits: the deployment loadout roster plus
+//! a single `keyset_epoch` drift value.
 //!
-//! After a host loads (or generates) the deployment keyset, it can derive the
-//! family commits that a control plane needs *before* any proof is produced:
-//! per-program `app_exe_commit`s, the shared `app_vm_commit`, the deferral
-//! `def_hook_commit` and `deferral_cached_commit`, a `keyset_epoch` that hashes
-//! over all of them, and whether the deployment is `evm_ready`. Nothing else in
-//! axiom-edge exposes these — today they appear only inside a produced EVM proof
-//! (`crates/proof/src/lib.rs`), which is far too late for a verifier deploy.
+//! # What this emits, and what it deliberately does not
 //!
-//! This module is the pure, prover-free half: the serializable shape, the
-//! commit encoding, and the epoch hash. The `emit_manifest` binary is the thin
-//! host-side driver that reconstructs the SDK from the on-disk keyset, derives
-//! the raw commit digests, and calls [`CommitInputs::into_manifest`] here. The
-//! split keeps every byte-level decision (field order, hex encoding, epoch
-//! algorithm) unit-testable without a multi-minute keygen.
+//! After a host loads (or generates) the deployment keyset, almost everything a
+//! consumer needs is *already an openvm type and already served*: `GET /vk/{name}`
+//! returns a [`VmStarkVerifyingKey`] whose [`VerificationBaseline`] carries, per
+//! child program, `app_exe_commit`, `expected_def_hook_commit`, the four
+//! `*_vk_commit`s, `memory_dimensions`, and `num_user_pvs`. The shared
+//! `app_vm_commit` is *derivable* from that baseline (it is
+//! `poseidon2_hash_slice` over the `app_vk_commit` / `leaf_vk_commit` /
+//! `internal_for_leaf_vk_commit` components — see the crate `openvm-sdk`
+//! `AggProver::vm_or_hook_commit`), so nothing needs to re-emit it either.
 //!
-//! # Cross-repo contract — the encoding is load-bearing
+//! Two things have no openvm type and are served nowhere, so this manifest emits
+//! exactly them:
 //!
-//! The shape and encoding intentionally match lighter's `EdgeManifest`
-//! (`~/lighter-evm-backend/crates/regen-agg-commits/src/manifest.rs`) field for
-//! field, so this file is a drop-in for anything that reads that manifest. The
-//! one decision that must not drift: **commits are the raw little-endian
-//! limb-digest hex** ([`digest_to_bytes`] — each BabyBear limb as a
-//! little-endian `u32`). The L1-verifier deploy step consumes this file and
-//! re-composes the canonical big-endian `CommitBytes` itself
-//! (`le_limbs_to_be` in lighter's `scripts/ci-devnet.sh`). Emitting big-endian
-//! here would pin the verifier contract to the wrong commit — a silent failure
-//! that only surfaces as a rejected proof at the end of a long CI job.
+//! 1. **The loadout roster** — which programs are deployed together, their
+//!    versions, and which one is the terminal `top`. This is a deployment
+//!    concept; openvm has no type for it. Each entry reuses axiom-edge's own
+//!    [`ProgramRef`] for `(name, version)`.
+//! 2. **`keyset_epoch`** — a single-value identity for the whole keyset, for
+//!    cross-cluster drift checks (milestone M5). Defined in axiom-edge's own
+//!    terms (see [`compute_keyset_epoch`]); it is not lighter's algorithm and
+//!    nothing requires the two to agree.
+//!
+//! Each roster entry also carries its `app_exe_commit`. For a `child` program
+//! this value is redundant with the served vk, but for the `top` program it is
+//! carried *nowhere else*: the exporter writes a `vk/{name}.app_vm_vk.bin` blob
+//! only for `child` programs, so `GET /vk/{top}` is a 404 and the top's
+//! `app_exe_commit` — which an L1-verifier deploy must pin alongside the shared
+//! `app_vm_commit` — has no other source. Keeping it on every entry (rather than
+//! only the top) makes the roster self-describing and makes `keyset_epoch` a
+//! pure function of the emitted file, recomputable without any vk download.
+//!
+//! # Encoding
+//!
+//! Every commit is emitted as [`continuations_v2::CommitBytes`] via that type's
+//! own serialization: the **canonical** big-endian 32-byte form an L1 verifier
+//! pins. This is the form `EvmProof.app_commit` and `AppExecutionCommit` use.
+//! There is intentionally no little-endian limb form anywhere — emitting
+//! canonical bytes removes the `le_limbs_to_be` re-composition (and its silent
+//! wrong-endianness failure mode) from every consumer.
 //!
 //! # Reproducibility
 //!
-//! Every field is a deterministic function of the on-disk keyset bytes (the
-//! `deferral/cached_pk` and the `program.vmexe` files) computed with pure field
-//! arithmetic and SHA-256. Two hosts that load the *same* keyset bundle derive
-//! byte-identical commits and therefore an identical [`KeysetManifest::keyset_epoch`].
+//! `app_exe_commit` is a pure function of a program's `program.vmexe` (a hash of
+//! the program commit, initial memory root, and initial pc). Two hosts that load
+//! the *same* keyset bundle therefore derive byte-identical roster commits and an
+//! identical [`KeysetManifest::keyset_epoch`].
+//!
+//! [`VmStarkVerifyingKey`]: verify_stark::vk::VmStarkVerifyingKey
+//! [`VerificationBaseline`]: verify_stark::vk::VerificationBaseline
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
 
-/// The manifest schema version. Matches lighter's `MANIFEST_SCHEMA_VERSION`;
-/// bump in lockstep on any shape change.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
+use continuations_v2::CommitBytes;
+use protocol::ProgramRef;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The conventional filename for the emitted manifest, written next to the
 /// artifacts. Deliberately *not* `manifest.json`: a keyset bundle produced by
-/// lighter's exporter already carries its own private `manifest.json`, and this
-/// host-emitted file must never collide with or clobber it.
-pub const KEYSET_MANIFEST_FILE_NAME: &str = "edge-manifest.json";
+/// lighter's exporter carries its own private `manifest.json` with a different
+/// (larger) shape, and this host-emitted file must never collide with it.
+pub const KEYSET_MANIFEST_FILE_NAME: &str = "keyset-manifest.json";
+
+/// Domain-separation tag folded into every [`compute_keyset_epoch`] hash. Names
+/// the algorithm as axiom-edge's own (v1) so a future shape change is
+/// distinguishable and can never collide with another producer's hash.
+pub const KEYSET_EPOCH_DOMAIN: &[u8] = b"axiom-edge/keyset-epoch/v1";
 
 /// Explicit program role — nothing reading the manifest should have to infer
 /// which program is the terminal one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgramRole {
-    /// A program that can appear as a deferral child of an aggregation program;
-    /// its app-VM vk is exported at `vk/{name}.app_vm_vk.bin` and served by the
+    /// A program that appears as a deferral child of an aggregation program; its
+    /// app-VM vk is exported at `vk/{name}.app_vm_vk.bin` and served by the
     /// manager at `GET /vk/{name}`.
     Child,
-    /// The terminal (final-agg) program — no vk blob. A planned L1-verifier
-    /// deploy reads this program's `app_exe_commit` (plus the shared
-    /// `app_vm_commit`) to pin the verifier contract.
+    /// The terminal (final-agg) program — no vk blob, so `GET /vk/{name}` 404s.
+    /// An L1-verifier deploy reads this program's `app_exe_commit` (plus the
+    /// shared, derivable `app_vm_commit`) to pin the verifier contract.
     Top,
 }
 
-/// One program in the deployment loadout.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestProgram {
-    /// Loadout name; also the `programs/{name}/{version}/` path component and
-    /// (for children) the `vk/{name}.app_vm_vk.bin` filename.
-    pub name: String,
-    pub version: u32,
-    /// This program's exe commit, as the raw little-endian limb-digest hex
-    /// ([`digest_to_bytes`] then [`hex0x`]).
-    pub app_exe_commit: String,
-    pub role: ProgramRole,
-}
-
-/// KZG SRS sizes for an EVM-ready keyset. Present iff `evm_ready`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Halo2Meta {
-    pub verifier_k: usize,
-    pub wrapper_k: usize,
-}
-
-/// The emitted `edge-manifest.json`, typed. Field order here is the serialized
-/// field order — kept identical to lighter's `EdgeManifest` so the two producers
-/// agree byte-for-byte.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeysetManifest {
-    /// [`MANIFEST_SCHEMA_VERSION`].
-    pub schema_version: u32,
-    /// The loadout, in the canonical order the keyset epoch hashes over
-    /// (declaration order of `EDGE_PROGRAMS`).
-    pub programs: Vec<ManifestProgram>,
-    /// The shared app-VM commit for the whole program family, as the raw
-    /// little-endian limb-digest hex.
-    pub app_vm_commit: String,
-    /// The deferral path's `def_hook_commit`, raw little-endian limb-digest hex.
-    pub def_hook_commit: String,
-    /// The family-wide deferral cached commit, raw little-endian limb-digest
-    /// hex. Recorded for bookkeeping only — the Edge client independently
-    /// re-derives it from the vk it downloads.
-    pub deferral_cached_commit: String,
-    /// SHA-256 over every commit above (see [`compute_keyset_epoch`]) — the
-    /// keyset's identity for operator bookkeeping and rollout comparison.
-    pub keyset_epoch: String,
-    /// Whether root + halo2 material is present, i.e. the deployment can serve
-    /// `proof_type=evm`.
-    pub evm_ready: bool,
-    /// Present iff `evm_ready`: the KZG SRS sizes the deployment host must
-    /// provision (`kzg_bn254_<k>.srs`) alongside `halo2/halo2_pk`.
-    pub halo2: Option<Halo2Meta>,
-}
-
-/// One program's raw (pre-hex) commit inputs.
-#[derive(Debug, Clone)]
-pub struct RawProgram {
-    pub name: String,
-    pub version: u32,
-    /// Raw little-endian limb-digest bytes ([`digest_to_bytes`]).
-    pub app_exe_commit: [u8; 32],
-    pub role: ProgramRole,
-}
-
-/// The raw commit digests a host derives from its keyset, before hex encoding
-/// and epoch hashing. [`Self::into_manifest`] is the single place that turns
-/// these into the serialized [`KeysetManifest`], so the epoch is always
-/// computed the one canonical way.
-#[derive(Debug, Clone)]
-pub struct CommitInputs {
-    pub programs: Vec<RawProgram>,
-    pub app_vm_commit: [u8; 32],
-    pub def_hook_commit: [u8; 32],
-    pub deferral_cached_commit: [u8; 32],
-    pub evm_ready: bool,
-    pub halo2: Option<Halo2Meta>,
-}
-
-impl CommitInputs {
-    /// Assemble the serialized manifest, computing `keyset_epoch` from the raw
-    /// commit bytes. The epoch hashes over the same bytes the hex strings
-    /// encode, so it is independent of the hex formatting.
-    pub fn into_manifest(self) -> KeysetManifest {
-        let epoch = compute_keyset_epoch(
-            self.programs.iter().map(|p| &p.app_exe_commit),
-            &self.app_vm_commit,
-            &self.def_hook_commit,
-            &self.deferral_cached_commit,
-        );
-        KeysetManifest {
-            schema_version: MANIFEST_SCHEMA_VERSION,
-            programs: self
-                .programs
-                .into_iter()
-                .map(|p| ManifestProgram {
-                    name: p.name,
-                    version: p.version,
-                    app_exe_commit: hex0x(&p.app_exe_commit),
-                    role: p.role,
-                })
-                .collect(),
-            app_vm_commit: hex0x(&self.app_vm_commit),
-            def_hook_commit: hex0x(&self.def_hook_commit),
-            deferral_cached_commit: hex0x(&self.deferral_cached_commit),
-            keyset_epoch: hex0x(&epoch),
-            evm_ready: self.evm_ready,
-            halo2: self.halo2,
+impl ProgramRole {
+    /// Stable one-byte tag folded into the keyset epoch. Distinct from the
+    /// `serde` rename so the on-disk JSON spelling and the hash tag can evolve
+    /// independently.
+    fn epoch_tag(self) -> u8 {
+        match self {
+            ProgramRole::Child => 0,
+            ProgramRole::Top => 1,
         }
     }
 }
 
+/// One program in the deployment loadout: its `(name, version)` identity (reused
+/// from axiom-edge's [`ProgramRef`]), its role, and its exe commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestProgram {
+    /// Loadout identity — `name` is also the `programs/{name}/{version}/` path
+    /// component and (for children) the `vk/{name}.app_vm_vk.bin` filename.
+    /// Flattened so the JSON carries `name` and `version` at the entry's top
+    /// level.
+    #[serde(flatten)]
+    pub program: ProgramRef,
+    pub role: ProgramRole,
+    /// This program's app-exe commit, as canonical big-endian [`CommitBytes`].
+    /// The only source for the `top` program's value (it has no served vk).
+    pub app_exe_commit: CommitBytes,
+}
+
+/// The emitted `keyset-manifest.json`, typed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeysetManifest {
+    /// The loadout, in the order the epoch hashes over (declaration order of
+    /// `EDGE_PROGRAMS`).
+    pub programs: Vec<ManifestProgram>,
+    /// A single-value identity for the whole keyset (see
+    /// [`compute_keyset_epoch`]) — used for cross-cluster drift checks.
+    pub keyset_epoch: KeysetEpoch,
+}
+
 impl KeysetManifest {
+    /// Assemble a manifest from an assembled roster, computing its
+    /// `keyset_epoch`. This is the single place the epoch is produced, so it is
+    /// always the one canonical function of the roster.
+    pub fn new(programs: Vec<ManifestProgram>) -> Self {
+        let keyset_epoch = compute_keyset_epoch(&programs);
+        Self {
+            programs,
+            keyset_epoch,
+        }
+    }
+
     /// Serialize in the canonical on-disk form (pretty + trailing newline).
     pub fn to_json(&self) -> serde_json::Result<String> {
         Ok(serde_json::to_string_pretty(self)? + "\n")
     }
 
-    /// Internal-consistency checks mirroring lighter's `EdgeManifest::validate`:
-    /// a non-empty loadout, exactly one `role = top` program, and
-    /// `evm_ready ↔ halo2` agreement.
+    /// Internal-consistency checks: a non-empty loadout, and exactly one
+    /// `role = top` program (the L1-verifier deploy selects that single entry).
     pub fn validate(&self) -> Result<(), String> {
         if self.programs.is_empty() {
             return Err("manifest has no programs".to_string());
@@ -192,187 +157,210 @@ impl KeysetManifest {
                 "manifest must have exactly one role=top program, got {tops}"
             ));
         }
-        if self.evm_ready != self.halo2.is_some() {
-            return Err(format!(
-                "evm_ready = {} but halo2 meta is {}",
-                self.evm_ready,
-                if self.halo2.is_some() {
-                    "present"
-                } else {
-                    "absent"
-                },
-            ));
-        }
         Ok(())
     }
 }
 
-/// SHA-256 over every program's `app_exe_commit` (in loadout order), then
-/// `app_vm_commit`, `def_hook_commit`, and `deferral_cached_commit` — the raw
-/// 32-byte little-endian limb bytes of each, concatenated. Identical to
-/// lighter's `EdgeManifest::compute_keyset_epoch`.
-pub fn compute_keyset_epoch<'a>(
-    program_exe_commits: impl Iterator<Item = &'a [u8; 32]>,
-    app_vm_commit: &[u8; 32],
-    def_hook_commit: &[u8; 32],
-    deferral_cached_commit: &[u8; 32],
-) -> [u8; 32] {
+/// axiom-edge's keyset identity: `sha256` over a domain tag ([`KEYSET_EPOCH_DOMAIN`])
+/// followed by, for each program **in loadout order**, its length-prefixed name,
+/// its version (`u32` little-endian), its role tag (one byte), and its
+/// `app_exe_commit` (canonical 32 bytes). The length prefix makes the encoding
+/// unambiguous, and the order-sensitivity means any change to loadout
+/// membership, ordering, versions, roles, or any program's exe commit changes
+/// the epoch.
+///
+/// It is deliberately a pure function of the emitted roster: a consumer
+/// recomputes it from the file alone, with no vk download and no openvm hashing
+/// primitive. `app_vm_commit` is *not* folded in — it is derivable and not
+/// emitted, and the aggregation programs' exe commits already transitively
+/// encode the child vk commits, so the roster's exe commits are a sufficient
+/// keyset identity for drift detection.
+pub fn compute_keyset_epoch(programs: &[ManifestProgram]) -> KeysetEpoch {
     use sha2::{Digest as _, Sha256};
     let mut h = Sha256::new();
-    for commit in program_exe_commits {
-        h.update(commit);
+    h.update(KEYSET_EPOCH_DOMAIN);
+    for p in programs {
+        h.update((p.program.name.len() as u32).to_le_bytes());
+        h.update(p.program.name.as_bytes());
+        h.update(p.program.version.to_le_bytes());
+        h.update([p.role.epoch_tag()]);
+        h.update(p.app_exe_commit.as_slice());
     }
-    h.update(app_vm_commit);
-    h.update(def_hook_commit);
-    h.update(deferral_cached_commit);
-    h.finalize().into()
+    KeysetEpoch(h.finalize().into())
 }
 
-/// `0x`-prefixed lowercase hex. Matches lighter's `hex0x`.
-pub fn hex0x(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(2 + bytes.len() * 2);
-    s.push_str("0x");
-    for b in bytes {
-        write!(s, "{b:02x}").expect("writing to a String cannot fail");
+/// A keyset epoch: a raw 32-byte SHA-256 digest (not a BabyBear field digest, so
+/// not a [`CommitBytes`]). Serializes as a `0x`-prefixed lowercase hex string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeysetEpoch([u8; 32]);
+
+impl KeysetEpoch {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
-    s
 }
 
-/// Encode a digest into 32 bytes as the deferral framework's raw layout: each
-/// of the 8 BabyBear limbs written as a little-endian `u32`. Byte-for-byte
-/// identical to lighter's `lighter_agg_sdk::digest_to_bytes` and to what
-/// `verify_stark_unchecked` returns. **This is the load-bearing encoding** the
-/// L1-verifier consumer re-composes to big-endian; do not change it.
-pub fn digest_to_bytes(digest: openvm_stark_sdk::config::baby_bear_poseidon2::Digest) -> [u8; 32] {
-    use openvm_stark_backend::p3_field::PrimeField32;
-    let mut out = [0u8; 32];
-    for (i, v) in digest.iter().enumerate() {
-        out[i * 4..(i + 1) * 4].copy_from_slice(&v.as_canonical_u32().to_le_bytes());
+impl fmt::Display for KeysetEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{}", hex::encode(self.0))
     }
-    out
+}
+
+impl Serialize for KeysetEpoch {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_string().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for KeysetEpoch {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        let hex_str = s.strip_prefix("0x").unwrap_or(&s);
+        let bytes: [u8; 32] = hex::decode(hex_str)
+            .map_err(serde::de::Error::custom)?
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))?;
+        Ok(KeysetEpoch(bytes))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The lighter `EdgeManifest` fixture, copied verbatim. It is the
-    /// byte-for-byte target: our serialization and epoch must reproduce it, so
-    /// any drift from lighter's producer shape shows up here.
-    const FIXTURE: &str = include_str!("fixtures/edge-manifest.json");
-
-    fn decode32(hex: &str) -> [u8; 32] {
-        let raw = hex.strip_prefix("0x").expect("0x prefix");
-        let bytes = hex::decode(raw).expect("valid hex");
-        bytes.try_into().expect("32 bytes")
+    /// A valid canonical [`CommitBytes`] from small BabyBear limbs. `CommitBytes`
+    /// enforces canonicity, so this exercises the real encoding without a keygen.
+    fn commit(seed: u32) -> CommitBytes {
+        CommitBytes::from([seed, seed + 1, seed + 2, seed + 3, 4, 5, 6, 7])
     }
 
-    fn fixture() -> KeysetManifest {
-        serde_json::from_str(FIXTURE).expect("fixture parses")
+    fn program(name: &str, version: u32, role: ProgramRole, seed: u32) -> ManifestProgram {
+        ManifestProgram {
+            program: ProgramRef::new(name, version),
+            role,
+            app_exe_commit: commit(seed),
+        }
     }
 
-    /// Parse → re-serialize reproduces the fixture bytes exactly. This pins the
-    /// field order, the `snake_case` role encoding, the 2-space pretty
-    /// indentation, and the trailing newline — i.e. that our shape is a
-    /// byte-for-byte match for lighter's `EdgeManifest`.
+    fn sample() -> KeysetManifest {
+        KeysetManifest::new(vec![
+            program("evm-leaf", 1, ProgramRole::Child, 10),
+            program("evm-agg", 1, ProgramRole::Child, 20),
+            program("final-agg", 1, ProgramRole::Top, 30),
+        ])
+    }
+
+    /// The roster serializes to `{name, version, role, app_exe_commit}` per
+    /// entry, and the whole manifest round-trips byte-identically.
     #[test]
-    fn fixture_round_trips_byte_identically() {
-        let manifest = fixture();
-        assert_eq!(manifest.to_json().expect("serializes"), FIXTURE);
+    fn manifest_round_trips_and_has_expected_shape() {
+        let manifest = sample();
+        let json = manifest.to_json().expect("serializes");
+
+        // Flattened ProgramRef → name/version at the entry top level; role is
+        // snake_case; commits are canonical 0x hex.
+        assert!(json.contains("\"name\": \"final-agg\""));
+        assert!(json.contains("\"version\": 1"));
+        assert!(json.contains("\"role\": \"top\""));
+        assert!(json.contains("\"role\": \"child\""));
+        assert!(json.contains("\"app_exe_commit\": \"0x"));
+        assert!(json.contains("\"keyset_epoch\": \"0x"));
+
+        let parsed: KeysetManifest = serde_json::from_str(&json).expect("parses");
+        assert_eq!(parsed, manifest);
+        assert_eq!(parsed.to_json().expect("re-serializes"), json);
     }
 
-    /// Assembling from the fixture's raw commit bytes reproduces the fixture's
-    /// `keyset_epoch` and the entire fixture byte stream. This is the core
-    /// cross-check: our `CommitInputs::into_manifest` + `compute_keyset_epoch`
-    /// exactly reproduce lighter's producer for a real, pinned keyset.
+    /// `app_exe_commit` is the canonical big-endian `CommitBytes` form, *not* the
+    /// little-endian limb layout the previous revision emitted. This pins the
+    /// encoding switch: the JSON hex must equal `CommitBytes` serialization and
+    /// must differ from the LE-limb bytes (for a non-palindromic digest).
     #[test]
-    fn assembling_from_raw_commits_reproduces_the_fixture() {
-        let f = fixture();
-        let inputs = CommitInputs {
-            programs: f
-                .programs
-                .iter()
-                .map(|p| RawProgram {
-                    name: p.name.clone(),
-                    version: p.version,
-                    app_exe_commit: decode32(&p.app_exe_commit),
-                    role: p.role,
-                })
-                .collect(),
-            app_vm_commit: decode32(&f.app_vm_commit),
-            def_hook_commit: decode32(&f.def_hook_commit),
-            deferral_cached_commit: decode32(&f.deferral_cached_commit),
-            evm_ready: f.evm_ready,
-            halo2: f.halo2,
-        };
-        let assembled = inputs.into_manifest();
-        assert_eq!(
-            assembled.keyset_epoch, f.keyset_epoch,
-            "recomputed epoch must match the fixture's recorded epoch",
-        );
-        assert_eq!(
-            assembled.to_json().expect("serializes"),
-            FIXTURE,
-            "assembled manifest must be byte-identical to the fixture",
-        );
-    }
-
-    /// The epoch is a pure function of the commit bytes: reordering programs, or
-    /// changing any commit, changes the epoch; the identical inputs reproduce it.
-    #[test]
-    fn keyset_epoch_is_deterministic_and_order_sensitive() {
-        let f = fixture();
-        let exe: Vec<[u8; 32]> = f
-            .programs
-            .iter()
-            .map(|p| decode32(&p.app_exe_commit))
-            .collect();
-        let app_vm = decode32(&f.app_vm_commit);
-        let def_hook = decode32(&f.def_hook_commit);
-        let deferral = decode32(&f.deferral_cached_commit);
-
-        let epoch_a = compute_keyset_epoch(exe.iter(), &app_vm, &def_hook, &deferral);
-        let epoch_b = compute_keyset_epoch(exe.iter(), &app_vm, &def_hook, &deferral);
-        assert_eq!(epoch_a, epoch_b, "same inputs → same epoch");
-        assert_eq!(hex0x(&epoch_a), f.keyset_epoch);
-
-        // Swapping two programs changes the epoch (order is part of the identity).
-        let mut swapped = exe.clone();
-        swapped.swap(0, 2);
-        let epoch_swapped = compute_keyset_epoch(swapped.iter(), &app_vm, &def_hook, &deferral);
+    fn app_exe_commit_is_canonical_not_le_limbs() {
+        let c = commit(10);
+        let canonical = c.as_slice();
+        let le_limbs = c.to_field_le_bytes();
         assert_ne!(
-            epoch_a, epoch_swapped,
-            "program order must affect the epoch"
+            canonical, &le_limbs,
+            "canonical BE and LE-limb forms must differ for this digest, else the test proves nothing",
+        );
+
+        // The serialized field is the canonical form.
+        let p = program("evm-leaf", 1, ProgramRole::Child, 10);
+        let json = serde_json::to_string(&p).expect("serializes");
+        assert!(json.contains(&format!("0x{}", hex::encode(canonical))));
+        assert!(!json.contains(&hex::encode(le_limbs)));
+    }
+
+    /// The epoch is deterministic and sensitive to every part of the roster.
+    #[test]
+    fn keyset_epoch_is_deterministic_and_sensitive() {
+        let a = sample();
+        let b = sample();
+        assert_eq!(a.keyset_epoch, b.keyset_epoch, "same roster → same epoch");
+
+        // Reordering programs changes the epoch (order is part of the identity).
+        let mut reordered = a.programs.clone();
+        reordered.swap(0, 2);
+        assert_ne!(
+            KeysetManifest::new(reordered).keyset_epoch,
+            a.keyset_epoch,
+            "program order must affect the epoch",
+        );
+
+        // Changing a single exe commit changes the epoch.
+        let mut diff_commit = a.programs.clone();
+        diff_commit[1].app_exe_commit = commit(99);
+        assert_ne!(
+            KeysetManifest::new(diff_commit).keyset_epoch,
+            a.keyset_epoch
+        );
+
+        // Changing a role changes the epoch.
+        let mut diff_role = a.programs.clone();
+        diff_role[0].role = ProgramRole::Top;
+        assert_ne!(KeysetManifest::new(diff_role).keyset_epoch, a.keyset_epoch);
+
+        // Changing a version changes the epoch.
+        let mut diff_version = a.programs.clone();
+        diff_version[0].program.version = 2;
+        assert_ne!(
+            KeysetManifest::new(diff_version).keyset_epoch,
+            a.keyset_epoch
         );
     }
 
     #[test]
-    fn validate_accepts_the_fixture() {
-        fixture().validate().expect("fixture validates");
+    fn validate_accepts_exactly_one_top() {
+        sample().validate().expect("sample validates");
     }
 
     #[test]
-    fn validate_rejects_zero_or_two_top_programs() {
-        let mut m = fixture();
-        m.programs[2].role = ProgramRole::Child; // now zero tops
-        assert!(m.validate().unwrap_err().contains("exactly one role=top"));
+    fn validate_rejects_zero_or_two_tops() {
+        let mut zero = sample();
+        zero.programs[2].role = ProgramRole::Child; // now zero tops
+        assert!(zero
+            .validate()
+            .unwrap_err()
+            .contains("exactly one role=top"));
 
-        let mut m = fixture();
-        m.programs[0].role = ProgramRole::Top; // now two tops
-        assert!(m.validate().unwrap_err().contains("exactly one role=top"));
+        let mut two = sample();
+        two.programs[0].role = ProgramRole::Top; // now two tops
+        assert!(two.validate().unwrap_err().contains("exactly one role=top"));
     }
 
     #[test]
-    fn validate_rejects_evm_ready_halo2_disagreement() {
-        let mut m = fixture();
-        m.halo2 = None; // evm_ready still true
-        assert!(m.validate().unwrap_err().contains("evm_ready"));
+    fn validate_rejects_empty_loadout() {
+        let empty = KeysetManifest::new(vec![]);
+        assert!(empty.validate().unwrap_err().contains("no programs"));
     }
 
     #[test]
-    fn hex0x_is_lowercase_0x_prefixed() {
-        assert_eq!(hex0x(&[0x00, 0xab, 0xff]), "0x00abff");
-        assert_eq!(hex0x(&[0u8; 0]), "0x");
+    fn keyset_epoch_hex_round_trips() {
+        let epoch = sample().keyset_epoch;
+        let json = serde_json::to_string(&epoch).expect("serializes");
+        assert!(json.starts_with("\"0x"));
+        let parsed: KeysetEpoch = serde_json::from_str(&json).expect("parses");
+        assert_eq!(parsed, epoch);
     }
 }

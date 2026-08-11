@@ -1,39 +1,39 @@
-//! `emit_manifest` — a keygen host reports the keyset commits it derived.
+//! `emit_manifest` — a keygen host reports its deployment loadout and keyset epoch.
 //!
 //! Reads the on-disk keyset a worker boots from (`<artifacts>/deferral/cached_pk`
 //! plus one `programs/{name}/{version}/program.vmexe` per loadout entry),
 //! reconstructs the deployment SDK exactly the way the worker does at boot
-//! (`Sdk::from_deferral_cached_proving_key`), derives the family commits, and
-//! writes them next to the artifacts as `edge-manifest.json`
-//! ([`edge_worker::keyset_manifest`]).
+//! (`Sdk::from_deferral_cached_proving_key`), derives each program's
+//! `app_exe_commit`, and writes the loadout roster + `keyset_epoch` next to the
+//! artifacts as `keyset-manifest.json` ([`edge_worker::keyset_manifest`]).
 //!
-//! This is the axiom-edge side of milestone M3: a proving client needs each
-//! child program's vk (already served by the manager at `GET /vk/{name}`), and
-//! an L1-verifier deploy needs the top program's `app_exe_commit` plus the
-//! shared `app_vm_commit` *before* any proof is produced. Those commits exist on
-//! the host after keygen but were never exposed; this binary exposes them.
+//! ## Why this is all it emits
+//!
+//! Everything else a consumer needs is already an openvm type and already
+//! served. `GET /vk/{name}` returns a `VmStarkVerifyingKey` whose
+//! `VerificationBaseline` carries each child program's `app_exe_commit`,
+//! `expected_def_hook_commit`, the `*_vk_commit`s, `memory_dimensions`, and
+//! `num_user_pvs`; the shared `app_vm_commit` is *derivable* from that baseline
+//! (`poseidon2_hash_slice` over the app/leaf/internal-for-leaf vk commits), so it
+//! is re-emitted nowhere. What has no openvm type — the loadout roster and a
+//! single-value `keyset_epoch` drift check — is what this binary produces. See
+//! the [`edge_worker::keyset_manifest`] module docs for the full rationale.
+//!
+//! The one commit this binary genuinely surfaces is the **top** program's
+//! `app_exe_commit`: the exporter writes a vk blob for `role = child` programs
+//! only, so `GET /vk/{top}` is a 404 and the top's exe commit has no other
+//! source. It is carried on every roster entry (uniformly with children) so the
+//! roster is self-describing and the epoch is a pure function of the file.
 //!
 //! It does NOT run or change keygen and does not touch how proofs are produced —
 //! it only reads already-generated artifacts and reports derived values. Run it
 //! on the host that holds the keyset, after keygen/provisioning has populated
 //! the artifacts dir.
 //!
-//! ## Commit derivation (mirrors lighter's `regen-agg-commits` exporter)
-//!
-//! - `app_exe_commit` (per program): `sdk.prover(exe).generate_baseline().app_exe_commit`
-//! - `app_vm_commit` (shared): `sdk.prover(exe).app_vm_commit()` — exe-independent,
-//!   so it is read once from the first program.
-//! - `def_hook_commit`: `sdk.def_hook_commit()`
-//! - `deferral_cached_commit`: `sdk.deferral_circuit_cached_commits(0)` (single circuit)
-//!
-//! Every commit is emitted as raw little-endian limb-digest hex
-//! (`keyset_manifest::digest_to_bytes`). See the module docs for why that
-//! encoding is load-bearing.
-//!
 //! Reconstruction uses [`sdk_v2::CpuSdk`] regardless of the build's `cuda`
-//! feature: the commits are pure field-element hashes, independent of the
-//! proving engine, so deriving them on CPU is both correct and avoids coupling
-//! this offline reporting step to a GPU.
+//! feature: `app_exe_commit` is a pure field-element hash of the program
+//! executable, independent of the proving engine, so deriving it on CPU is both
+//! correct and avoids coupling this offline reporting step to a GPU.
 
 #[cfg(not(feature = "mock-provers"))]
 mod emit {
@@ -43,9 +43,9 @@ mod emit {
     use clap::Parser;
     use eyre::{ensure, eyre, Result, WrapErr};
 
+    use continuations_v2::CommitBytes;
     use edge_worker::keyset_manifest::{
-        digest_to_bytes, CommitInputs, Halo2Meta, ProgramRole, RawProgram,
-        KEYSET_MANIFEST_FILE_NAME,
+        KeysetManifest, ManifestProgram, ProgramRole, KEYSET_MANIFEST_FILE_NAME,
     };
     use openvm_sdk_config::SdkVmConfig;
     use openvm_stark_backend::Val;
@@ -58,16 +58,11 @@ mod emit {
     /// A pre-transpiled program executable, as loaded from `program.vmexe`.
     type Exe = VmExe<Val<SC>>;
 
-    /// Index of the single deferral circuit the deployment registers (mirrors
-    /// lighter's `DEFERRAL_DEF_IDX` and `create_edge_sdk_with_deferral`, which
-    /// registers exactly `[SupportedDeferral::VerifyStark]`).
-    const DEFERRAL_DEF_IDX: usize = 0;
-
     #[derive(Parser, Debug)]
     #[command(
         author,
         version,
-        about = "Emit the keyset commits (edge-manifest.json) derived from an on-disk axiom-edge keyset"
+        about = "Emit keyset-manifest.json (loadout roster + keyset epoch) from an on-disk axiom-edge keyset"
     )]
     struct Args {
         /// Base artifacts dir: holds `deferral/cached_pk` and
@@ -77,7 +72,7 @@ mod emit {
         artifacts_dir: PathBuf,
 
         /// Output path for the manifest. Defaults to
-        /// `<artifacts_dir>/edge-manifest.json`.
+        /// `<artifacts_dir>/keyset-manifest.json`.
         #[clap(long)]
         output: Option<PathBuf>,
 
@@ -95,13 +90,6 @@ mod emit {
         /// one program must resolve to `top` either way.
         #[clap(long)]
         top: Option<String>,
-
-        /// Directory holding `halo2_pk` (and its SRS files) — the worker's
-        /// `halo2_pk_path`. Required to report `evm_ready = true`: the manifest
-        /// is EVM-ready only when the cached_pk carries a root_pk AND this dir
-        /// has a `halo2_pk`. Ignored unless built with `--features evm-prove`.
-        #[clap(long)]
-        halo2_pk_path: Option<PathBuf>,
     }
 
     pub fn main() -> Result<()> {
@@ -142,11 +130,6 @@ mod emit {
                 )
             })?;
 
-        // Whether the cached pk carries the root proving key (half of EVM
-        // readiness). Captured before `cached_pk` is moved into the SDK.
-        #[cfg(feature = "evm-prove")]
-        let has_root_pk = cached_pk.root_pk.is_some();
-
         let sdk = CpuSdk::from_deferral_cached_proving_key(cached_pk).map_err(|e| {
             eyre!(
                 "reconstruct deferral SDK from {}: {e}",
@@ -154,30 +137,10 @@ mod emit {
             )
         })?;
 
-        // Deferral-path commits (require an active deferral prover, which the
-        // reconstruction provides when cached_pk carried deferral keys).
-        let def_hook_commit = digest_to_bytes(sdk.def_hook_commit().ok_or_else(|| {
-            eyre!(
-                "reconstructed SDK exposes no def_hook_commit — {} is not a deferral keyset \
-                 (was it generated with `keygen --with-deferral`?)",
-                cached_pk_path.display()
-            )
-        })?);
-        let deferral_cached_commit = {
-            let mut commits = sdk
-                .deferral_circuit_cached_commits(DEFERRAL_DEF_IDX)
-                .map_err(|e| eyre!("deferral_circuit_cached_commits({DEFERRAL_DEF_IDX}): {e}"))?;
-            ensure!(
-                commits.len() == 1,
-                "expected exactly one deferral cached commit at index {DEFERRAL_DEF_IDX}, got {}",
-                commits.len(),
-            );
-            *commits.pop().expect("length checked == 1").as_slice()
-        };
-
-        // Per-program exe commits + the shared vm commit (read once).
-        let mut app_vm_commit: Option<[u8; 32]> = None;
-        let mut raw_programs = Vec::with_capacity(programs.len());
+        // Per-program app_exe_commit, in loadout order. `app_exe_commit` is a
+        // hash of the program executable only; the reconstructed SDK is used
+        // solely to build the prover that exposes it.
+        let mut manifest_programs = Vec::with_capacity(programs.len());
         for program in &programs {
             let vmexe_path = args
                 .artifacts_dir
@@ -186,7 +149,7 @@ mod emit {
                 .join(program.version.to_string())
                 .join("program.vmexe");
             println!(
-                "Deriving commits for {program} from {}",
+                "Deriving app_exe_commit for {program} from {}",
                 vmexe_path.display()
             );
             let exe: Exe = read_object_from_file(&vmexe_path)
@@ -194,47 +157,16 @@ mod emit {
             let prover = sdk
                 .prover(Arc::new(exe))
                 .map_err(|e| eyre!("build prover for {program}: {e}"))?;
-            if app_vm_commit.is_none() {
-                app_vm_commit = Some(digest_to_bytes(prover.app_vm_commit()));
-            }
-            let app_exe_commit = digest_to_bytes(prover.generate_baseline().app_exe_commit);
+            let app_exe_commit = CommitBytes::from(prover.generate_baseline().app_exe_commit);
             let role = role_for(&program.name, &args);
-            raw_programs.push(RawProgram {
-                name: program.name.clone(),
-                version: program.version,
-                app_exe_commit,
+            manifest_programs.push(ManifestProgram {
+                program: program.clone(),
                 role,
+                app_exe_commit,
             });
         }
-        let app_vm_commit =
-            app_vm_commit.ok_or_else(|| eyre!("loadout resolved to zero programs"))?;
 
-        // EVM readiness + halo2 sizes. EVM-ready requires BOTH a root_pk in the
-        // cached pk AND a halo2_pk on disk; only then are the k sizes read (the
-        // one field that needs the >10GB pk loaded). A stark-only build can
-        // never be EVM-ready.
-        #[cfg(feature = "evm-prove")]
-        let (evm_ready, halo2) = evm_readiness(has_root_pk, args.halo2_pk_path.as_deref())?;
-        #[cfg(not(feature = "evm-prove"))]
-        let (evm_ready, halo2): (bool, Option<Halo2Meta>) = {
-            if args.halo2_pk_path.is_some() {
-                eprintln!(
-                    "warning: --halo2-pk-path given but this binary was built without \
-                     --features evm-prove; emitting evm_ready=false"
-                );
-            }
-            (false, None)
-        };
-
-        let manifest = CommitInputs {
-            programs: raw_programs,
-            app_vm_commit,
-            def_hook_commit,
-            deferral_cached_commit,
-            evm_ready,
-            halo2,
-        }
-        .into_manifest();
+        let manifest = KeysetManifest::new(manifest_programs);
 
         // Fail loudly on an inconsistent loadout (e.g. no single top) rather
         // than writing a manifest a downstream consumer will reject.
@@ -250,8 +182,8 @@ mod emit {
 
         println!("\n=== keyset manifest emitted ===");
         println!("  path:         {}", output.display());
+        println!("  programs:     {}", manifest.programs.len());
         println!("  keyset_epoch: {}", manifest.keyset_epoch);
-        println!("  evm_ready:    {}", manifest.evm_ready);
         Ok(())
     }
 
@@ -271,44 +203,6 @@ mod emit {
                 }
             }
         }
-    }
-
-    /// EVM readiness and halo2 SRS sizes. Ready iff the cached pk carried a
-    /// root_pk and a `halo2_pk` file is present; the SRS `k` sizes are then read
-    /// from the halo2 pk. Any other combination is stark-only.
-    #[cfg(feature = "evm-prove")]
-    fn evm_readiness(
-        has_root_pk: bool,
-        halo2_pk_path: Option<&std::path::Path>,
-    ) -> Result<(bool, Option<Halo2Meta>)> {
-        let halo2_pk_file = halo2_pk_path.map(|d| d.join("halo2_pk"));
-        let halo2_present = halo2_pk_file.as_ref().map(|p| p.is_file()).unwrap_or(false);
-        if !(has_root_pk && halo2_present) {
-            if halo2_pk_path.is_some() || has_root_pk {
-                eprintln!(
-                    "note: not EVM-ready (cached_pk root_pk present: {has_root_pk}, \
-                     halo2_pk present: {halo2_present}); emitting evm_ready=false"
-                );
-            }
-            return Ok((false, None));
-        }
-        let halo2_pk_file = halo2_pk_file.expect("halo2_present implies Some");
-        println!("Reading halo2 SRS sizes from {}", halo2_pk_file.display());
-        let meta = load_halo2_meta(&halo2_pk_file)?;
-        Ok((true, Some(meta)))
-    }
-
-    /// Read the halo2 verifier/wrapper `k` sizes from the proving key. Mirrors
-    /// `artifacts::try_load_evm`'s field access; this loads the (large) pk.
-    #[cfg(feature = "evm-prove")]
-    fn load_halo2_meta(path: &std::path::Path) -> Result<Halo2Meta> {
-        use sdk_v2::fs::read_halo2_pk_from_file;
-        let pk =
-            read_halo2_pk_from_file(path).wrap_err_with(|| format!("read {}", path.display()))?;
-        Ok(Halo2Meta {
-            verifier_k: pk.verifier.pinning.metadata.config_params.k,
-            wrapper_k: pk.wrapper.pinning.metadata.config_params.k,
-        })
     }
 }
 
