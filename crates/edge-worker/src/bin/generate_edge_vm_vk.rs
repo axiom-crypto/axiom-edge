@@ -58,35 +58,27 @@ mod generate_vm_vk {
         let Some(pk_path) = deferral_cached_pk else {
             return create_edge_sdk();
         };
-        #[cfg(feature = "evm-prove")]
-        {
-            use color_eyre::eyre::eyre;
-            use openvm_sdk_config::SdkVmConfig;
-            use sdk_v2::fs::read_object_from_file;
-            use sdk_v2::keygen::SdkCachedProvingKey;
-            println!(
-                "Using deferral-enabled SDK (cached_pk: {})",
-                pk_path.display()
-            );
-            let cached_pk: SdkCachedProvingKey<SdkVmConfig> = read_object_from_file(pk_path)
-                .wrap_err_with(|| {
-                    format!("Failed to read deferral cached_pk: {}", pk_path.display())
-                })?;
-            Sdk::from_deferral_cached_proving_key(cached_pk)
-                .map_err(|e| eyre!("Failed to reconstruct deferral SDK from cached_pk: {e}"))
-        }
-        #[cfg(not(feature = "evm-prove"))]
-        {
-            // The deferral keyset is STARK-level; the vk only depends on the
-            // deferral VM *config* (the transpiler + agg vk), not the cached
-            // proving key, so a stark-only (`--halo2 none`) deferral deployment
-            // rebuilds that config with the same non-evm constructor
-            // `keygen --with-deferral` used. Mirrors `convert_fixtures`.
-            use edge_worker::openvm_config::create_edge_sdk_with_deferral;
-            let _ = pk_path;
-            println!("Using deferral-enabled SDK (stark-only; VM config only)");
-            create_edge_sdk_with_deferral()
-        }
+        // The vk this binary emits is key-derived — `build_vm_vk_from_elf_with_sdk`
+        // clones `sdk.agg_vk()` and calls `prover.generate_baseline()` — so the SDK
+        // must carry the actual deferral keys, not a rebuilt config. Reconstruct it
+        // from the on-disk cached pk in every build. `from_deferral_cached_proving_key`
+        // and `SdkCachedProvingKey` are not `evm-prove`-gated in openvm (only their
+        // `root_pk` handling is behind `root-prover`), so this one path compiles for
+        // both stark-only and evm deployments; each reads what its own keygen wrote.
+        use color_eyre::eyre::eyre;
+        use openvm_sdk_config::SdkVmConfig;
+        use sdk_v2::fs::read_object_from_file;
+        use sdk_v2::keygen::SdkCachedProvingKey;
+        println!(
+            "Using deferral-enabled SDK (cached_pk: {})",
+            pk_path.display()
+        );
+        let cached_pk: SdkCachedProvingKey<SdkVmConfig> = read_object_from_file(pk_path)
+            .wrap_err_with(|| {
+                format!("Failed to read deferral cached_pk: {}", pk_path.display())
+            })?;
+        Sdk::from_deferral_cached_proving_key(cached_pk)
+            .map_err(|e| eyre!("Failed to reconstruct deferral SDK from cached_pk: {e}"))
     }
 }
 
