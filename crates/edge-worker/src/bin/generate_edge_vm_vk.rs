@@ -4,9 +4,9 @@ mod generate_vm_vk {
     use color_eyre::eyre::{Result, WrapErr};
     use edge_worker::openvm_config::create_edge_sdk;
     use edge_worker::stark_verify::build_vm_vk_from_elf_with_sdk;
+    use edge_worker::stark_verify::write_vm_vk_bincode;
     use sdk_v2::Sdk;
     use std::path::{Path, PathBuf};
-    use verify_stark::vk::write_vk_to_file;
 
     #[derive(Parser, Debug)]
     #[command(
@@ -42,9 +42,16 @@ mod generate_vm_vk {
         let args = Args::parse();
         let sdk = build_sdk(args.deferral_cached_pk.as_deref())?;
         let vk = build_vm_vk_from_elf_with_sdk(&sdk, &args.elf)?;
-        write_vk_to_file(&args.output, &vk).wrap_err_with(|| {
-            format!("Failed to write VM verifying key {}", args.output.display())
-        })?;
+        // BINCODE, not openvm's `write_vk_to_file` (which is bitcode).
+        //
+        // The filename this produces — `vk/{name}.app_vm_vk.bin` — has a format
+        // contract set by lighter's exporter (`regen-agg-commits/src/export.rs`,
+        // `bincode::serialize(vk)`), and the manager serves the file verbatim at
+        // `GET /vk/{name}`. Every consumer reads it with `bincode::deserialize`
+        // (`lighter-prover`'s edge and orchestrator clients). Writing bitcode here
+        // produced a file of the right size that every client rejected with
+        // "unexpected end of file".
+        write_vm_vk_bincode(&args.output, &vk)?;
 
         println!("VM verifying key written to {}", args.output.display());
         Ok(())
