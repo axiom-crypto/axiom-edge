@@ -92,6 +92,39 @@ pub fn load_final_proof<P: AsRef<Path>>(path: P) -> Result<VmStarkProof> {
     })
 }
 
+/// Write a `VmStarkVerifyingKey` as **bincode**.
+///
+/// The `vk/{name}.app_vm_vk.bin` filename has a format contract set by lighter's
+/// exporter (`regen-agg-commits/src/export.rs` writes `bincode::serialize(vk)`),
+/// and the manager serves the file verbatim at `GET /vk/{name}`. Every consumer
+/// — lighter-prover's edge and orchestrator clients — reads it with
+/// `bincode::deserialize`.
+///
+/// Deliberately NOT openvm's `verify_stark::vk::write_vk_to_file`, which is
+/// **bitcode**. Using that produced a file of exactly the right size that every
+/// client rejected with "unexpected end of file". Writer and reader live here
+/// together so the codec cannot drift between the two binaries again.
+pub fn write_vm_vk_bincode(path: &Path, vk: &VmStarkVerifyingKey) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("Failed to create {}", parent.display()))?;
+    }
+    let bytes = bincode::serialize(vk).wrap_err("Failed to bincode-serialize the vk")?;
+    fs::write(path, bytes)
+        .wrap_err_with(|| format!("Failed to write VM verifying key {}", path.display()))
+}
+
+/// Read a `VmStarkVerifyingKey` written by [`write_vm_vk_bincode`].
+pub fn read_vm_vk_bincode(path: &Path) -> Result<VmStarkVerifyingKey> {
+    let bytes = fs::read(path).wrap_err_with(|| format!("Failed to read {}", path.display()))?;
+    bincode::deserialize(&bytes).wrap_err_with(|| {
+        format!(
+            "Failed to bincode-decode VM verifying key {}",
+            path.display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::decode_persisted_final_proof_bytes;
