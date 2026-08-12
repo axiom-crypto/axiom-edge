@@ -92,32 +92,6 @@ pub fn load_final_proof<P: AsRef<Path>>(path: P) -> Result<VmStarkProof> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::decode_persisted_final_proof_bytes;
-
-    #[test]
-    fn test_decode_persisted_final_proof_bytes_accepts_raw_bytes() {
-        let path = std::path::Path::new("/tmp/test.proof.bin");
-        let raw = b"raw-proof-bytes".to_vec();
-
-        let decoded = decode_persisted_final_proof_bytes(path, raw.clone()).unwrap();
-
-        assert_eq!(decoded, raw);
-    }
-
-    #[test]
-    fn test_decode_persisted_final_proof_bytes_decompresses_zstd() {
-        let path = std::path::Path::new("/tmp/test.proof.bin");
-        let raw = b"compressed-proof-bytes".to_vec();
-        let compressed = zstd::encode_all(&raw[..], 19).unwrap();
-
-        let decoded = decode_persisted_final_proof_bytes(path, compressed).unwrap();
-
-        assert_eq!(decoded, raw);
-    }
-}
-
 /// Write a `VmStarkVerifyingKey` as **bincode**.
 ///
 /// The `vk/{name}.app_vm_vk.bin` filename has a format contract set by lighter's
@@ -149,4 +123,30 @@ pub fn read_vm_vk_bincode(path: &Path) -> Result<VmStarkVerifyingKey> {
             path.display()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_persisted_final_proof_bytes;
+
+    #[test]
+    fn test_decode_persisted_final_proof_bytes_accepts_raw_bytes() {
+        let path = std::path::Path::new("/tmp/test.proof.bin");
+        let raw = b"raw-proof-bytes".to_vec();
+
+        let decoded = decode_persisted_final_proof_bytes(path, raw.clone()).unwrap();
+
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn test_decode_persisted_final_proof_bytes_decompresses_zstd() {
+        let path = std::path::Path::new("/tmp/test.proof.bin");
+        let raw = b"compressed-proof-bytes".to_vec();
+        let compressed = zstd::encode_all(&raw[..], 19).unwrap();
+
+        let decoded = decode_persisted_final_proof_bytes(path, compressed).unwrap();
+
+        assert_eq!(decoded, raw);
+    }
 }
