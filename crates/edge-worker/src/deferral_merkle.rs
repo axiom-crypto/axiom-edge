@@ -117,7 +117,7 @@ pub fn finalize_deferral_path(path: &[[F; DIGEST_SIZE]], depth: usize) -> Vec<[F
 /// worker no longer holds — the deferral-SDK reconstruction in
 /// `run_deferral_tail_merge` builds and discards its own AppProver).
 pub fn build_initial_memory_tree(
-    exe: &VmExe<F>,
+    exe: &VmExe,
     system_config: &SystemConfig,
 ) -> MerkleTree<F, DIGEST_SIZE> {
     let memory_dimensions = system_config.memory_config.memory_dimensions();
@@ -162,7 +162,7 @@ pub fn build_memory_tree(
 /// identical in the initial and final images and the within-address
 /// siblings match.
 pub fn depth0_deferral_merkle_proofs(
-    exe: &VmExe<F>,
+    exe: &VmExe,
     system_config: &SystemConfig,
     final_memory: &AddressMap,
     hasher: &Poseidon2Hasher<F>,

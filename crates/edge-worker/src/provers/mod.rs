@@ -206,6 +206,7 @@ pub mod real_prover_types {
     pub type Halo2Prover = sdk_v2::prover::Halo2Prover;
 
     // Re-export prover types
+    pub use continuations_v2::circuit::inner::VerifierCircuitType;
     pub use continuations_v2::prover::ChildVkKind;
 }
 

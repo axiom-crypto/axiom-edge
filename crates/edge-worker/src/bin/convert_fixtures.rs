@@ -36,7 +36,7 @@ mod converter {
     use sdk_v2::config::AggregationSystemParams;
     use sdk_v2::fs::write_object_to_file;
     use sdk_v2::types::ExecutableFormat;
-    use sdk_v2::{Sdk, StdIn, F};
+    use sdk_v2::{Sdk, StdIn};
     use std::path::{Path, PathBuf};
 
     #[derive(Parser)]
@@ -549,7 +549,7 @@ mod converter {
         // Load VmExe
         let exe_path = artifacts_dir.join("program.vmexe");
         println!("  Loading program.vmexe from {}...", exe_path.display());
-        let exe: sdk_v2::openvm_circuit::arch::instructions::exe::VmExe<F> =
+        let exe: sdk_v2::openvm_circuit::arch::instructions::exe::VmExe =
             sdk_v2::fs::read_object_from_file(&exe_path)?;
         let exe = Arc::new(exe);
         println!("  program.vmexe loaded: {} instructions", exe.program.len());

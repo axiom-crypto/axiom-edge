@@ -2,8 +2,8 @@ use std::{fs, path::Path};
 
 use bitcode::{deserialize, serialize};
 use color_eyre::eyre::{Result, WrapErr};
-use openvm_stark_backend::{codec::Decode, Val};
-use sdk_v2::{openvm_circuit::arch::instructions::exe::VmExe, types::ExecutableFormat, SC};
+use openvm_stark_backend::codec::Decode;
+use sdk_v2::{openvm_circuit::arch::instructions::exe::VmExe, types::ExecutableFormat};
 use verify_stark::{vk::VmStarkVerifyingKey, VmStarkProof};
 
 use crate::openvm_config::create_edge_sdk;
@@ -24,7 +24,7 @@ pub fn build_vm_vk_from_elf<P: AsRef<Path>>(elf_path: P) -> Result<VmStarkVerify
     // used for program.vmexe on disk before generating the verification baseline.
     let exe_bytes = serialize(exe.as_ref())
         .wrap_err("Failed to bitcode-serialize VmExe while building VM verifying key")?;
-    let exe: VmExe<Val<SC>> = deserialize(&exe_bytes)
+    let exe: VmExe = deserialize(&exe_bytes)
         .wrap_err("Failed to bitcode-deserialize VmExe while building VM verifying key")?;
     let prover = sdk
         .prover(exe)

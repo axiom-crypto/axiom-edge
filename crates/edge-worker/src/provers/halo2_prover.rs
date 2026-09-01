@@ -131,7 +131,8 @@ mod real_impl {
         let prove_time_ms = prove_start.elapsed().as_millis() as u64;
         let sub_metrics = telemetry::span_timing::drain_span_timings();
 
-        let typed: proof::EvmProof = evm_proof_sdk;
+        let typed: proof::EvmProof = evm_proof_sdk
+            .map_err(|e| eyre::eyre!("Halo2 proof to EvmProof conversion failed: {e}"))?;
         let result = ProtoEvmProof {
             context: job.context,
             state: EvmProofState {
