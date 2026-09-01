@@ -207,6 +207,12 @@ pub mod real_prover_types {
 
     // Re-export prover types
     pub use continuations_v2::prover::ChildVkKind;
+    /// Which node of the recursion tree an inner prover is being built for.
+    /// Replaced the old `is_self_recursive: bool` argument of
+    /// `Inner{Cpu,Gpu}Prover::from_pk` in openvm v2.1.0 — the leaf and
+    /// internal-for-leaf circuits are now distinguished from each other, not
+    /// just from the self-recursive one.
+    pub use continuations_v2::circuit::inner::VerifierCircuitType;
 }
 
 #[cfg(not(feature = "mock-provers"))]

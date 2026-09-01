@@ -95,7 +95,9 @@ fn prove_leaf_impl(job: LeafProverJob) -> Result<Vec<ProofResult>> {
 
 #[cfg(not(feature = "mock-provers"))]
 mod real_impl {
-    use super::super::real_prover_types::{ChildVkKind, LeafProver, RecursionEngine};
+    use super::super::real_prover_types::{
+        ChildVkKind, LeafProver, RecursionEngine, VerifierCircuitType,
+    };
     use super::*;
     use crate::artifacts::ArtifactStore;
     use proof::ProofWithPublicValue;
@@ -137,11 +139,11 @@ mod real_impl {
                 "Creating LeafProverInstance (deferral_mode={})",
                 def_hook_cached_commit.is_some()
             );
-            // is_recursive = false because leaf proofs aggregate app proofs (not recursive)
+            // `Leaf` because leaf proofs aggregate app proofs (not recursive).
             let prover: LeafProver = LeafProver::from_pk::<RecursionEngine>(
                 app_vk,
                 edge_artifacts.agg_stark_pk.prefix.leaf.clone(),
-                false,
+                VerifierCircuitType::Leaf,
                 def_hook_cached_commit,
             );
             info!("LeafProverInstance created successfully");
