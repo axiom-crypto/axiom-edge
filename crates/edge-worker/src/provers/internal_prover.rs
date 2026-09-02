@@ -122,7 +122,9 @@ fn prove_internal_impl(job: InternalProverJob) -> Result<Vec<ProofResult>> {
 
 #[cfg(not(feature = "mock-provers"))]
 mod real_impl {
-    use super::super::real_prover_types::{ChildVkKind, InternalProver, RecursionEngine};
+    use super::super::real_prover_types::{
+        ChildVkKind, InternalProver, RecursionEngine, VerifierCircuitType,
+    };
     use super::*;
     use crate::artifacts::ArtifactStore;
     use proof::ProofWithPublicValue;
@@ -169,7 +171,7 @@ mod real_impl {
             let internal_for_leaf_prover: InternalProver = InternalProver::from_pk::<RecursionEngine>(
                 leaf_vk,
                 edge_artifacts.agg_stark_pk.prefix.internal_for_leaf.clone(),
-                false,
+                VerifierCircuitType::InternalForLeaf,
                 def_hook_cached_commit,
             );
             info!("Created internal_for_leaf_prover");
@@ -186,7 +188,7 @@ mod real_impl {
                 InternalProver::from_pk::<RecursionEngine>(
                     internal_for_leaf_vk,
                     edge_artifacts.agg_stark_pk.internal_recursive.clone(),
-                    true,
+                    VerifierCircuitType::InternalRecursive,
                     def_hook_cached_commit,
                 );
             info!("Created internal_recursive_prover");

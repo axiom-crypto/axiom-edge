@@ -3,9 +3,12 @@
 # Schema reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
 # Goal: a working release gate, not a perpetually-red CI job. We curate the
 # license allow-list to what the current tree actually pulls in, allow the
-# small set of git sources the project pins on purpose (openvm, stark-backend,
-# poseidon2, halo2curves-axiom), and document the two unfixable transitive
-# advisories with dated rationale.
+# small set of git sources the project pins on purpose (openvm, stark-backend),
+# and document the unfixable transitive advisories with dated rationale.
+#
+# NOTE: `all-features = false`, so the `evm-prove` dependency graph (halo2,
+# halo2-lib, snark-verifier — all git-pinned) is NOT covered by these checks.
+# Enabling it would require extending `allow-git` and the license allow-list.
 
 [graph]
 all-features = false
@@ -28,14 +31,12 @@ version = 2
 yanked = "warn"
 # Each ignore is a transitive dep we can't push a fix for from this repo. The
 # direct chain runs through the openvm / stark-backend / halo2 graph; re-review
-# on every bump of those pins and after 2026-09-01.
+# on every bump of those pins and after 2027-03-01. Last reviewed 2026-09-02
+# against openvm v2.1.0-rc.0 (RUSTSEC-2026-0097 dropped: no longer matches).
 ignore = [
     # bincode 1.x — workspace pins for backwards-compatible wire format.
     # Migration to 2.x ripples through proof/protocol and openvm-stark-sdk.
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; migration tracked as follow-up" },
-    # rand 0.8.x soundness note covers a custom-global-logger path we do not
-    # exercise. Awaiting openvm/stark-backend bump to rand 0.9.
-    { id = "RUSTSEC-2026-0097", reason = "rand 0.8.x; affected path not exercised; transitive via openvm" },
     # ansi_term, derivative, generational-arena, paste — all transitive via the
     # halo2 / openvm graph; replacing them is upstream's call.
     { id = "RUSTSEC-2021-0139", reason = "ansi_term unmaintained; transitive via halo2" },
@@ -291,5 +292,4 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/openvm-org/openvm.git",
     "https://github.com/openvm-org/stark-backend.git",
-    "https://github.com/axiom-crypto/halo2curves.git",
 ]

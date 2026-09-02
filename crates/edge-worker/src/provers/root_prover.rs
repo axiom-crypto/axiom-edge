@@ -63,7 +63,7 @@ fn prove_root_impl(_job: RootProverJob) -> Result<RootProofState> {
 #[cfg(all(not(feature = "mock-provers"), feature = "evm-prove"))]
 mod real_impl {
     use super::super::real_prover_types::{
-        ChildVkKind, InternalProver, RecursionEngine, RootEngine, RootProver,
+        ChildVkKind, InternalProver, RecursionEngine, RootEngine, RootProver, VerifierCircuitType,
     };
     use super::*;
     use crate::artifacts::ArtifactStore;
@@ -137,7 +137,7 @@ mod real_impl {
                 InternalProver::from_pk::<RecursionEngine>(
                     internal_for_leaf_vk,
                     edge_artifacts.agg_stark_pk.internal_recursive.clone(),
-                    true, // is_self_recursive
+                    VerifierCircuitType::InternalRecursive,
                     def_hook_cached_commit,
                 );
             let internal_recursive_prover = Arc::new(internal_recursive_prover);
@@ -149,7 +149,7 @@ mod real_impl {
                 .ok_or_else(|| {
                     eyre::eyre!(
                         "internal_recursive_prover has no self_vk_pcs_data; \
-                         construct with is_self_recursive=true"
+                         construct with VerifierCircuitType::InternalRecursive"
                     )
                 })?
                 .commitment
