@@ -63,8 +63,7 @@ fn prove_root_impl(_job: RootProverJob) -> Result<RootProofState> {
 #[cfg(all(not(feature = "mock-provers"), feature = "evm-prove"))]
 mod real_impl {
     use super::super::real_prover_types::{
-        ChildVkKind, InternalProver, RecursionEngine, RootEngine, RootProver,
-        VerifierCircuitType,
+        ChildVkKind, InternalProver, RecursionEngine, RootEngine, RootProver, VerifierCircuitType,
     };
     use super::*;
     use crate::artifacts::ArtifactStore;
