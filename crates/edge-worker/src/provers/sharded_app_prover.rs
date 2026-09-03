@@ -657,19 +657,22 @@ mod real_impl {
             }
         }
 
-        /// Clone the VM state at the current boundary (a snapshot start-state).
-        fn clone_boundary_state(&self) -> VmState<GuestMemory> {
+        /// Capture an independent sparse snapshot of the VM state at the current boundary.
+        fn snapshot_boundary_state(&self) -> VmState<GuestMemory> {
             #[cfg(not(feature = "rvr"))]
             {
                 self.exec_state
                     .as_ref()
                     .expect("exec_state present")
                     .vm_state
-                    .clone()
+                    .sparse_clone()
             }
             #[cfg(feature = "rvr")]
             {
-                self.vm_state.as_ref().expect("vm_state present").clone()
+                self.vm_state
+                    .as_ref()
+                    .expect("vm_state present")
+                    .sparse_clone()
             }
         }
 
@@ -719,10 +722,18 @@ mod real_impl {
 
     /// Snapshot of VM state at a point during execution.
     /// Used to avoid re-executing from instruction 0 for each segment.
-    #[derive(Clone)]
     struct VmSnapshot {
         vm_state: VmState<GuestMemory>,
         instret: u64,
+    }
+
+    impl VmSnapshot {
+        fn sparse_clone(&self) -> Self {
+            Self {
+                vm_state: self.vm_state.sparse_clone(),
+                instret: self.instret,
+            }
+        }
     }
 
     /// Data sent from executor thread to prover thread(s) for each assigned segment.
@@ -996,7 +1007,7 @@ mod real_impl {
             let mut snapshots: VecDeque<VmSnapshot> = VecDeque::with_capacity(2);
             if seeds_initial_snapshot(prover_id) {
                 snapshots.push_back(VmSnapshot {
-                    vm_state: vm_state.clone(),
+                    vm_state: vm_state.sparse_clone(),
                     instret: 0,
                 });
             }
@@ -1014,7 +1025,7 @@ mod real_impl {
                 // If this segment is assigned to us, send it to the prover
                 if curr_idx % num_provers == prover_id {
                     let snapshot = if num_provers == 1 && curr_idx == 0 {
-                        snapshots[0].clone()
+                        snapshots[0].sparse_clone()
                     } else {
                         snapshots
                             .pop_front()
@@ -1044,7 +1055,7 @@ mod real_impl {
                 if saves_snapshot_at(curr_idx, num_provers, prover_id) {
                     let instret = driver.instret();
                     snapshots.push_back(VmSnapshot {
-                        vm_state: driver.clone_boundary_state(),
+                        vm_state: driver.snapshot_boundary_state(),
                         instret,
                     });
                 }
@@ -1112,11 +1123,6 @@ mod real_impl {
             // Generate STARK proof for this segment
             let _ = telemetry::span_timing::drain_span_timings(); // clear stale timings
             let stark_start = std::time::Instant::now();
-            // openvm v2.1 ships only touched-marked pages to the device (unmarked
-            // → zero). Our snapshot + fast-forward reconstructs correct memory
-            // *values* but not the touched-page metadata a sequential preflight
-            // would carry, so rebuild it from the image before proving.
-            vm_state.memory.memory.recompute_touched_pages();
             let prove_result = app_prover.prove_segment(vm_state, &prove_data.segment);
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
@@ -1326,11 +1332,6 @@ mod real_impl {
             // Generate STARK proof for this segment
             let _ = telemetry::span_timing::drain_span_timings();
             let stark_start = std::time::Instant::now();
-            // openvm v2.1 ships only touched-marked pages to the device (unmarked
-            // → zero). Our snapshot + fast-forward reconstructs correct memory
-            // *values* but not the touched-page metadata a sequential preflight
-            // would carry, so rebuild it from the image before proving.
-            vm_state.memory.memory.recompute_touched_pages();
             let prove_result = app_prover.prove_segment(vm_state, &prove_data.segment);
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
@@ -1568,7 +1569,7 @@ mod real_impl {
             let mut snapshots: VecDeque<VmSnapshot> = VecDeque::with_capacity(2);
             if seeds_initial_snapshot(prover_id) {
                 snapshots.push_back(VmSnapshot {
-                    vm_state: vm_state.clone(),
+                    vm_state: vm_state.sparse_clone(),
                     instret: 0,
                 });
             }
@@ -1585,7 +1586,7 @@ mod real_impl {
 
                 if curr_idx % num_provers == prover_id {
                     let snapshot = if num_provers == 1 && curr_idx == 0 {
-                        snapshots[0].clone()
+                        snapshots[0].sparse_clone()
                     } else {
                         snapshots
                             .pop_front()
@@ -1618,7 +1619,7 @@ mod real_impl {
                 if saves_snapshot_at(curr_idx, num_provers, prover_id) {
                     let instret = driver.instret();
                     snapshots.push_back(VmSnapshot {
-                        vm_state: driver.clone_boundary_state(),
+                        vm_state: driver.snapshot_boundary_state(),
                         instret,
                     });
                 }
@@ -1686,11 +1687,6 @@ mod real_impl {
 
             let _ = telemetry::span_timing::drain_span_timings();
             let stark_start = std::time::Instant::now();
-            // openvm v2.1 ships only touched-marked pages to the device (unmarked
-            // → zero). Our snapshot + fast-forward reconstructs correct memory
-            // *values* but not the touched-page metadata a sequential preflight
-            // would carry, so rebuild it from the image before proving.
-            vm_state.memory.memory.recompute_touched_pages();
             let prove_result = app_prover.prove_segment(vm_state, &prove_data.segment);
             let (proof, final_memory) = match prove_result {
                 Ok(r) => r,
