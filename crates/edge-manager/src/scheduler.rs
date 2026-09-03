@@ -483,6 +483,22 @@ impl EdgeProofState {
         }
         Ok(None)
     }
+
+    /// Dispatch as much queued work as the currently-free worker slots allow.
+    ///
+    /// [`try_dequeue_work`](Self::try_dequeue_work) moves at most one item per
+    /// call because it is driven by single worker completions. Callers that
+    /// free several slots at once (see
+    /// [`EdgeStateStore::set_num_segments`](EdgeStateStore::set_num_segments))
+    /// must drain in a loop instead, or the queue keeps items that no later
+    /// event will come back for.
+    fn drain_pending(&mut self, proof_uuid: &str) -> Result<Vec<AssignedWork>> {
+        let mut assigned = Vec::new();
+        while let Some(work) = self.try_dequeue_work(proof_uuid)? {
+            assigned.push(work);
+        }
+        Ok(assigned)
+    }
 }
 
 /// Store for per-proof Edge state.
@@ -569,11 +585,31 @@ impl EdgeStateStore {
         self.proofs.insert(proof_uuid.to_string(), state);
     }
 
-    /// Set the number of segments for a proof.
-    pub async fn set_num_segments(&self, proof_uuid: &str, num_segments: usize) -> Result<()> {
+    /// Record the segment count for a proof, releasing the `ShardedAppProve`
+    /// slot of every worker that is already done, and return any queued work
+    /// the freed slots make dispatchable. The caller MUST dispatch it.
+    ///
+    /// Returning work matters because this is the one place that frees slots
+    /// outside a worker completion. App results that land before `ExecuteE2`
+    /// see `num_segments == None`, so `worker_completed_all_segments` reports
+    /// false and no slot is freed while they arrive; leaf requests built from
+    /// them find every worker busy and go to `pending`. This call frees the
+    /// slots — and if it did not also drain, nothing would: the proof's app
+    /// results are all in, so no further completion arrives to trigger
+    /// `try_dequeue_work`, and the queued leaves sit until the proof times
+    /// out. That is reachable whenever every app result beats `ExecuteE2`,
+    /// which in practice means `num_segments` an exact multiple of
+    /// `num_workers` — an even split, so no straggler batch is left to be
+    /// flushed by `flush_pending_leaf_batches` and dispatched against the
+    /// now-free workers.
+    pub async fn set_num_segments(
+        &self,
+        proof_uuid: &str,
+        num_segments: usize,
+    ) -> Result<Vec<AssignedWork>> {
         let state = {
             let Some(entry) = self.proofs.get(proof_uuid) else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             entry.value().clone()
         };
@@ -589,6 +625,7 @@ impl EdgeStateStore {
         // This is important for workers that have no assigned segments (num_segments < num_workers)
         // or workers that have already completed all their segments
         let num_workers = guard.num_workers;
+        let mut freed_a_slot = false;
         for worker in &mut guard.workers {
             if worker.active_proof_count > 0 {
                 // Check if this worker has any segments assigned
@@ -618,10 +655,15 @@ impl EdgeStateStore {
                     worker
                         .active_proofs
                         .retain(|p| p.step != Step::ShardedAppProve);
+                    freed_a_slot = true;
                 }
             }
         }
-        Ok(())
+
+        if !freed_a_slot {
+            return Ok(Vec::new());
+        }
+        guard.drain_pending(proof_uuid)
     }
 
     /// Remove proof state.
@@ -963,6 +1005,110 @@ mod tests {
                 .iter()
                 .any(|p| p.step == Step::ShardedAppProve));
         }
+    }
+
+    #[tokio::test]
+    async fn test_set_num_segments_drains_work_queued_before_execute_e2() {
+        // Regression: an even segment split (num_segments a multiple of
+        // num_workers) let every app result land before ExecuteE2. No slot was
+        // freed while they arrived, so the leaf requests built from them were
+        // queued; `set_num_segments` then freed all the slots but returned
+        // nothing, and with no further worker completion coming for the proof
+        // nothing ever drained the queue. The proof stalled until its timeout.
+        let store = EdgeStateStore::new(4);
+        let num_workers = 4;
+        let num_segments = 8; // 2 per worker, an exact multiple
+        store.init_proof("p-even", make_test_workers(num_workers), 48);
+
+        // Every app result arrives before ExecuteE2, so num_segments is still
+        // unknown and no worker slot may be freed yet.
+        for segment_idx in 0..num_segments {
+            let assigned = store
+                .worker_completed(
+                    "p-even",
+                    segment_idx % num_workers,
+                    &make_app_result("p-even", segment_idx),
+                )
+                .await
+                .unwrap();
+            assert!(
+                assigned.is_none(),
+                "segment {segment_idx} must not dispatch before num_segments is known"
+            );
+        }
+        {
+            let state = store.proofs.get("p-even").unwrap().clone();
+            let guard = state.lock().await;
+            for worker in &guard.workers {
+                assert_eq!(
+                    worker.active_proof_count, 1,
+                    "worker {} should still hold its ShardedAppProve slot",
+                    worker.id
+                );
+            }
+        }
+
+        // The completed batches turn into leaf requests. Every worker is busy,
+        // so all of them queue.
+        for batch in 0..2 {
+            let start = batch * 4;
+            let assigned = store
+                .enqueue_or_assign(
+                    "p-even",
+                    make_leaf_envelope("p-even", start, start + 3),
+                    Step::LeafProve,
+                )
+                .await
+                .unwrap();
+            assert!(
+                assigned.is_none(),
+                "leaf [{start}-{}] should queue",
+                start + 3
+            );
+        }
+
+        // ExecuteE2 finally lands. It frees the slots, so it must also hand
+        // back the queued leaves — nothing else will come asking for them.
+        let dispatchable = store
+            .set_num_segments("p-even", num_segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatchable.len(),
+            2,
+            "set_num_segments must dispatch both queued leaf proofs"
+        );
+        for work in &dispatchable {
+            assert_eq!(work.step, Step::LeafProve);
+            assert_eq!(work.proof_uuid, "p-even");
+        }
+
+        // Queue is empty and the assignments are reflected in worker state.
+        {
+            let state = store.proofs.get("p-even").unwrap().clone();
+            let guard = state.lock().await;
+            assert!(guard.pending.is_empty(), "pending queue should be drained");
+            let leaf_slots: usize = guard
+                .workers
+                .iter()
+                .map(|w| {
+                    w.active_proofs
+                        .iter()
+                        .filter(|p| p.step == Step::LeafProve)
+                        .count()
+                })
+                .sum();
+            assert_eq!(leaf_slots, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_num_segments_returns_nothing_when_queue_empty() {
+        // The common path: nothing queued, so there is nothing to hand back.
+        let store = EdgeStateStore::new(4);
+        store.init_proof("p-empty", make_test_workers(4), 48);
+        let dispatchable = store.set_num_segments("p-empty", 8).await.unwrap();
+        assert!(dispatchable.is_empty());
     }
 
     #[test]

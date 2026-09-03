@@ -1162,6 +1162,7 @@ def ensure_artifacts(
     artifacts = Path(args.artifacts_path)
     convert_bin = build_workspace / "target/release/convert_fixtures"
     keygen_bin = build_workspace / "target/release/keygen"
+    vk_bin = build_workspace / "target/release/generate_edge_vm_vk"
     version_file = artifacts / ".keygen-inputs-hash"
     cargo_lock = build_workspace / "Cargo.lock"
     lock_hash = _sha256_file(cargo_lock) if cargo_lock.is_file() else "unknown"
@@ -1219,7 +1220,9 @@ def ensure_artifacts(
         print("OpenVM config:        standard (built-in)")
 
     # vmexes are cheap; always regenerate. Avoids "did I pick up my new ELF?".
-    print(f"Will (re)build vmexes for {len(args.programs)} program(s).")
+    # A vk bundle is (re)built for every program in the same pass so
+    # `GET /vk/{name}` resolves for all of them, including the final-agg.
+    print(f"Will (re)build vmexes + vks for {len(args.programs)} program(s).")
     print()
 
     did_any = False
@@ -1237,9 +1240,10 @@ def ensure_artifacts(
         f for f in features.split(",") if f and f != "cuda"
     )
 
-    # Always build convert_fixtures (needed for elf-to-vmexe). Build keygen
-    # bin only if we'll run it.
-    bins_to_build = ["convert_fixtures"]
+    # Always build convert_fixtures (needed for elf-to-vmexe) and
+    # generate_edge_vm_vk (a vk bundle is written for every program below).
+    # Build keygen bin only if we'll run it.
+    bins_to_build = ["convert_fixtures", "generate_edge_vm_vk"]
     if need_shared_keygen:
         bins_to_build.append("keygen")
 
@@ -1337,6 +1341,48 @@ def ensure_artifacts(
             convert_cmd += ["--deferral-cached-pk", str(artifacts / "deferral" / "cached_pk")]
         proc = subprocess.Popen(
             convert_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=gen_env,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print("    " + line.rstrip())
+        rc = proc.wait()
+        if rc != 0:
+            sys.exit(rc)
+
+        # Verifying key: build a vk bundle for EVERY program (not just the
+        # deferral children an export verifies), so `GET /vk/{name}` on the
+        # manager resolves uniformly — including the final aggregation program,
+        # whose app_exe_commit is otherwise carried nowhere else. The manager
+        # serves `vk/{name}.app_vm_vk.bin` (edge-manager
+        # `handlers.rs::vk_rel_path` → `format!("vk/{name}.app_vm_vk.bin")`), so
+        # the output filename must match that byte-for-byte or the download 404s.
+        # Unconditional by the same standing decision as --regenerate; rollout
+        # cost is not a concern here.
+        vk_dir = artifacts / "vk"
+        vk_dir.mkdir(parents=True, exist_ok=True)
+        vk_path = vk_dir / f"{name}.app_vm_vk.bin"
+        print(f"  Building vk for ({name}, v{version}) → {vk_path}")
+        vk_cmd = [
+            str(vk_bin),
+            "--elf",
+            str(elf_path),
+            "--output",
+            str(vk_path),
+        ]
+        # Match the vmexe's transpiler exactly. A deferral guest (e.g. the final
+        # aggregation program) carries custom opcodes the standard transpiler
+        # cannot parse, so its vk must be built with the same deferral-enabled
+        # VM config `convert_fixtures` used for the vmexe just above. Pass the
+        # same cached_pk; without it the vk's baseline/app_exe_commit would not
+        # match what the worker proves against.
+        if args.with_deferral:
+            vk_cmd += ["--deferral-cached-pk", str(artifacts / "deferral" / "cached_pk")]
+        proc = subprocess.Popen(
+            vk_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

@@ -131,8 +131,12 @@ mod real_impl {
         let prove_time_ms = prove_start.elapsed().as_millis() as u64;
         let sub_metrics = telemetry::span_timing::drain_span_timings();
 
-        let typed: proof::EvmProof = evm_proof_sdk
-            .map_err(|e| eyre::eyre!("Halo2 proof to EvmProof conversion failed: {e}"))?;
+        // openvm v2.1.0 made `prove_for_evm` fallible: the SDK now validates the
+        // halo2 snark's instances (canonical Bn254 scalars, accumulator length)
+        // while converting them into `EvmProof`, and returns that as an error
+        // instead of panicking. Surface it as a normal prove failure.
+        let typed: proof::EvmProof =
+            evm_proof_sdk.map_err(|e| eyre::eyre!("EVM proof conversion failed: {e}"))?;
         let result = ProtoEvmProof {
             context: job.context,
             state: EvmProofState {

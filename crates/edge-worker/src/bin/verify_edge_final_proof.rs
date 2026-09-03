@@ -5,12 +5,10 @@ mod verify {
     use edge_worker::artifacts::EdgeArtifacts;
     use edge_worker::openvm_config::create_edge_sdk;
     use edge_worker::stark_verify::load_final_proof;
+    use edge_worker::stark_verify::{read_vm_vk_bincode, write_vm_vk_bincode};
     use sdk_v2::Sdk;
     use std::{env, path::PathBuf};
-    use verify_stark::{
-        verify_vm_stark_proof_decoded,
-        vk::{read_vk_from_file, write_vk_to_file, VmStarkVerifyingKey},
-    };
+    use verify_stark::{verify_vm_stark_proof_decoded, vk::VmStarkVerifyingKey};
 
     #[derive(Parser, Debug)]
     #[command(
@@ -59,9 +57,10 @@ mod verify {
         if let Some(path) = &args.vm_vk {
             if path.exists() {
                 println!("Using cached VM verifying key: {}", path.display());
-                return read_vk_from_file(path).wrap_err_with(|| {
-                    format!("Failed to read VM verifying key {}", path.display())
-                });
+                // The shared bincode pair in `stark_verify` — NOT openvm's
+                // `read_vk_from_file`, which is bitcode. Writer and reader live
+                // together there so the codec cannot drift.
+                return read_vm_vk_bincode(path);
             }
         }
 
@@ -118,8 +117,10 @@ mod verify {
         };
 
         if let Some(path) = &args.vm_vk {
-            write_vk_to_file(path, &vk)
-                .wrap_err_with(|| format!("Failed to write VM verifying key {}", path.display()))?;
+            // Same bincode pair the cache is READ with above. Writing openvm's
+            // bitcode here would make this tool unable to read back its own
+            // cache on the next run.
+            write_vm_vk_bincode(path, &vk)?;
             println!("Wrote VM verifying key: {}", path.display());
         }
 

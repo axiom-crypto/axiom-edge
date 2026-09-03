@@ -104,10 +104,24 @@ RUN if [ -n "$TOOLCHAIN_VERSION" ]; then \
 
 WORKDIR /app
 
+# Cargo caches, mounted on every cargo step below:
+#   /usr/local/cargo/registry — crates.io tarballs + index
+#   /usr/local/cargo/git      — git dependencies (db/ + checkouts/)
+#
+# The `git` mount matters as much as `registry`: openvm is a git dep, and
+# cargo recursively initialises its submodules — which for the `rvr` feature
+# reaches openvm -> extensions/keccak256/rvr/ffi/openssl -> cloudflare-quiche.
+# Without this cache every cold build re-clones that whole tree from GitHub, so
+# one transient DNS/network blip anywhere in the chain fails the build with a
+# misleading `revision <sha> not found` (cargo reports that for *any* failed
+# fetch, not just a genuinely missing commit). Caching it makes the fetch
+# happen once per host instead of once per build.
+
 # Planner stage: Generate dependency recipe
 FROM base AS planner
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     cargo chef prepare --recipe-path recipe.json
 
@@ -131,6 +145,7 @@ ENV JEMALLOC_SYS_WITH_MALLOC_CONF=${JEMALLOC_SYS_WITH_MALLOC_CONF}
 # Build dependencies using cargo-chef
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     cargo ${TOOLCHAIN_VERSION} chef cook --profile "$PROFILE" -p edge-worker --features "$FEATURES" --recipe-path recipe.json && \
     cargo ${TOOLCHAIN_VERSION} chef cook --profile "$PROFILE" -p edge-manager --recipe-path recipe.json
@@ -138,6 +153,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Build the application, reusing dependency cache
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     set -eu; \
     cargo ${TOOLCHAIN_VERSION} fetch --locked; \

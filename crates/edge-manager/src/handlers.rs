@@ -1292,12 +1292,24 @@ pub async fn proof_result(State(state): State<Arc<AppState>>, body: Bytes) -> im
     // Handle ExecuteE2 result specially to set num_segments before scheduling more work.
     if let ProofResult::ExecuteE2(ref e2_result) = result {
         let num_segments = e2_result.state.num_segments;
-        if let Err(e) = state
+        match state
             .state_store
             .set_num_segments(&proof_uuid, num_segments)
             .await
         {
-            error!("Failed to set num_segments: {}", e);
+            // Learning the segment count frees the slot of every worker that
+            // already finished, which can make queued work dispatchable. This
+            // is the only slot release not driven by a worker completion, so
+            // if we drop what it hands back nothing else will pick it up.
+            Ok(dispatchable) => {
+                for work in dispatchable {
+                    let state_clone = state.clone();
+                    tokio::spawn(async move {
+                        send_work_with_retry(&state_clone, work, 3).await;
+                    });
+                }
+            }
+            Err(e) => error!("Failed to set num_segments: {}", e),
         }
     }
 
