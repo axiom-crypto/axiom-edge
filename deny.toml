@@ -118,6 +118,22 @@ license-files = []
 crate = "openvm-rv32-adapters"
 expression = "MIT"
 license-files = []
+# Present only on the `v2.x.0-preview.1` openvm tag this branch pins (`rvr-state`
+# is part of the rvr work); their manifests omit `license.workspace = true`, so
+# cargo-deny sees no expression at all. openvm is dual MIT OR Apache-2.0 at the
+# repo root; we elect MIT here to match the entries above.
+[[licenses.clarify]]
+crate = "rvr-state"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-riscv-guest"
+expression = "MIT"
+license-files = []
+[[licenses.clarify]]
+crate = "openvm-algebra-utils"
+expression = "MIT"
+license-files = []
 [[licenses.clarify]]
 crate = "openvm-rv32im-circuit"
 expression = "MIT"
