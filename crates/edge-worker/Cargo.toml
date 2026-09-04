@@ -62,9 +62,10 @@ cuda = ["sdk-v2/halo2-gpu", "continuations-v2/cuda", "dep:openvm-cuda-common", "
 # Performance features
 jemalloc = ["sdk-v2/jemalloc", "tikv-jemalloc-ctl"]
 parallel = ["sdk-v2/parallel"]
-# aot toggles the openvm-sdk backend path
-aot = ["sdk-v2/aot"]
-tco = ["sdk-v2/tco"]            # mutually exclusive with aot
+# rvr toggles the openvm-sdk rvr execution backend (replaces the old `aot`
+# backend removed in openvm develop-v2.1.0).
+rvr = ["sdk-v2/rvr"]
+tco = ["sdk-v2/tco"]            # mutually exclusive with rvr
 unprotected = ["sdk-v2/unprotected"]  # requires nightly
 
 [dependencies]

@@ -51,7 +51,6 @@ static ARTIFACT_STORE: OnceCell<Arc<ArtifactStore>> = OnceCell::new();
 mod real_artifacts {
     use super::*;
     use openvm_sdk_config::SdkVmConfig;
-    use openvm_stark_backend::Val;
     // Deferral artifacts (unconditional — deferral proving is STARK-level and
     // does not need `root-prover`/`evm-prove`; only halo2/root wrapping does).
     use openvm_stark_sdk::config::baby_bear_poseidon2::Digest;
@@ -59,7 +58,6 @@ mod real_artifacts {
     use sdk_v2::keygen::{AggProvingKey, AppProvingKey, SdkCachedProvingKey};
     use sdk_v2::openvm_circuit::arch::instructions::exe::VmExe;
     use sdk_v2::Sdk;
-    use sdk_v2::SC;
     use std::path::Path;
     use tracing::warn;
     // Halo2/root artifacts — only under `evm-prove`.
@@ -70,7 +68,7 @@ mod real_artifacts {
         sdk_v2::keygen::{Halo2ProvingKey, RootProvingKey},
     };
 
-    pub type Exe = VmExe<Val<SC>>;
+    pub type Exe = VmExe;
 
     /// EVM (halo2) inputs needed at worker boot to construct the halo2 prover.
     ///

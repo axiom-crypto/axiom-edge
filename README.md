@@ -103,7 +103,7 @@ Then start the stack in a halo2 mode with that key mounted:
 (`--halo2` selects the EVM-wrap mode: `none` (default, stark-only — no halo2),
 `full` (every worker is eligible for the manager-dispatched root → halo2 EVM
 step), or `dedicated` (isolate that step on the highest-id worker, its own GPU). `full`/`dedicated` append
-`evm-prove` to the default features `cuda,jemalloc,parallel,aot,unprotected` —
+`evm-prove` to the default features `cuda,jemalloc,parallel,rvr,unprotected` —
 no need to re-list them via `--features`.)
 
 Submit with `proof_type=evm` — either `start-proof.sh --proof-type evm …`, or by

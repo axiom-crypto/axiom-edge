@@ -82,7 +82,7 @@ metrics_output_path = "../metrics-output"
 # NOTE: this file is the single source of truth. start-provers does NOT read
 # any of these from environment variables (secrets like METRICS_API_KEY are
 # the only env-var inputs).
-features = "cuda,jemalloc,parallel,aot,unprotected"
+features = "cuda,jemalloc,parallel,rvr,unprotected"
 toolchain = "+1.91.1"
 cuda_arch = "120"
 jemalloc = "retain:true,background_thread:true,metadata_thp:always,dirty_decay_ms:10000,muzzy_decay_ms:10000,abort_conf:true"

@@ -373,7 +373,7 @@ fn prepare_uploaded_input_bytes(
     match format {
         UploadedInputFormat::BincodeStdin => Ok(input_data.to_vec()),
         UploadedInputFormat::CompactBytes => {
-            let mut stdin: StdIn<sdk_v2::F> = StdIn::default();
+            let mut stdin: StdIn = StdIn::default();
             stdin.write_bytes(input_data);
             Ok(bincode::serialize(&stdin)?)
         }
@@ -2289,7 +2289,7 @@ mod tests {
         let compact =
             prepare_uploaded_input_bytes(UploadedInputFormat::CompactBytes, &raw_input).unwrap();
         let direct = prepare_uploaded_input_bytes(UploadedInputFormat::BincodeStdin, &{
-            let mut stdin: StdIn<sdk_v2::F> = StdIn::default();
+            let mut stdin: StdIn = StdIn::default();
             stdin.write_bytes(&raw_input);
             bincode::serialize(&stdin).unwrap()
         })

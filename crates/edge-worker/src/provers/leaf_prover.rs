@@ -139,7 +139,8 @@ mod real_impl {
                 "Creating LeafProverInstance (deferral_mode={})",
                 def_hook_cached_commit.is_some()
             );
-            // `Leaf` because leaf proofs aggregate app proofs (not recursive).
+            // `Leaf` because this layer aggregates app proofs: its child vk is
+            // the app vk, and it never verifies its own circuit.
             let prover: LeafProver = LeafProver::from_pk::<RecursionEngine>(
                 app_vk,
                 edge_artifacts.agg_stark_pk.prefix.leaf.clone(),

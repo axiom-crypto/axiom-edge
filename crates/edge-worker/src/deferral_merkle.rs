@@ -35,16 +35,16 @@ use proof::F;
 use sdk_v2::openvm_circuit::{
     arch::{
         hasher::poseidon2::{vm_poseidon2_hasher, Poseidon2Hasher},
-        instructions::{exe::VmExe, DEFERRAL_AS},
+        instructions::{exe::VmExe, DEFERRAL_AS, VM_DIGEST_WIDTH},
         SystemConfig, VmState,
     },
-    system::memory::{dimensions::MemoryDimensions, merkle::MerkleTree, AddressMap, CHUNK},
+    system::memory::{dimensions::MemoryDimensions, merkle::MerkleTree, AddressMap},
 };
 
 /// Length of one digest in field elements (BabyBear). Equals openvm's
-/// `DIGEST_SIZE` / `CHUNK`. Re-exported so callers can spell
-/// `[F; DIGEST_SIZE]` without re-imports.
-pub const DIGEST_SIZE: usize = CHUNK;
+/// `VM_DIGEST_WIDTH` (the memory merkle digest width, formerly `CHUNK`).
+/// Re-exported so callers can spell `[F; DIGEST_SIZE]` without re-imports.
+pub const DIGEST_SIZE: usize = VM_DIGEST_WIDTH;
 
 /// Extract the depth-independent `(DEFERRAL_AS, 0)` authentication path
 /// from a memory merkle tree.
@@ -117,15 +117,15 @@ pub fn finalize_deferral_path(path: &[[F; DIGEST_SIZE]], depth: usize) -> Vec<[F
 /// worker no longer holds — the deferral-SDK reconstruction in
 /// `run_deferral_tail_merge` builds and discards its own AppProver).
 pub fn build_initial_memory_tree(
-    exe: &VmExe<F>,
+    exe: &VmExe,
     system_config: &SystemConfig,
 ) -> MerkleTree<F, DIGEST_SIZE> {
     let memory_dimensions = system_config.memory_config.memory_dimensions();
-    let initial_state = VmState::<F, _>::initial(
+    let initial_state = VmState::initial(
         system_config,
         &exe.init_memory,
         exe.pc_start,
-        Vec::<Vec<F>>::new(),
+        Vec::<Vec<u8>>::new(),
     );
     let hasher: Poseidon2Hasher<F> = vm_poseidon2_hasher();
     build_memory_tree(&initial_state.memory.memory, &memory_dimensions, &hasher)
@@ -162,7 +162,7 @@ pub fn build_memory_tree(
 /// identical in the initial and final images and the within-address
 /// siblings match.
 pub fn depth0_deferral_merkle_proofs(
-    exe: &VmExe<F>,
+    exe: &VmExe,
     system_config: &SystemConfig,
     final_memory: &AddressMap,
     hasher: &Poseidon2Hasher<F>,

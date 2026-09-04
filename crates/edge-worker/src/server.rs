@@ -232,11 +232,12 @@ pub async fn run_server(config: WorkerConfig) -> Result<()> {
 }
 
 /// Build the per-program `AppExecutionInstances` map in parallel via
-/// rayon. Each entry is the result of an ~115 s AOT compile (gcc) that
-/// briefly allocates ~1.66 GB on the GPU while building the
-/// interpreters, then frees it. Parallelizing across the loadout lets
-/// total boot time stay roughly constant in N programs (bounded by one
-/// program's build time + parallelism overhead).
+/// rayon. Under the `rvr` execution backend each entry is a native
+/// ahead-of-time compile (clang); without it the interpreter instances
+/// build quickly. Either way it briefly allocates ~1.66 GB on the GPU
+/// while building the instances, then frees it. Parallelizing across the
+/// loadout lets total boot time stay roughly constant in N programs
+/// (bounded by one program's build time + parallelism overhead).
 #[cfg(not(feature = "mock-provers"))]
 fn build_app_worker_context(
     programs: &[protocol::ProgramRef],

@@ -2,8 +2,12 @@ use std::{fs, path::Path};
 
 use bitcode::{deserialize, serialize};
 use color_eyre::eyre::{Result, WrapErr};
-use openvm_stark_backend::{codec::Decode, Val};
-use sdk_v2::{openvm_circuit::arch::instructions::exe::VmExe, types::ExecutableFormat, Sdk, SC};
+use openvm_stark_backend::codec::Decode;
+// `VmExe` takes no field parameter on the openvm tag this branch pins
+// (v2.x.0-preview.1); it is `VmExe<Val<SC>>` on v2.1.0-rc.0, which `main`
+// tracks. Keep the local form when merging `main` — see the `let exe:` binding
+// in `build_vm_vk_from_elf_with_sdk` below.
+use sdk_v2::{openvm_circuit::arch::instructions::exe::VmExe, types::ExecutableFormat, Sdk};
 use verify_stark::{vk::VmStarkVerifyingKey, VmStarkProof};
 
 use crate::openvm_config::create_edge_sdk;
@@ -46,7 +50,7 @@ pub fn build_vm_vk_from_elf_with_sdk<P: AsRef<Path>>(
     // used for program.vmexe on disk before generating the verification baseline.
     let exe_bytes = serialize(exe.as_ref())
         .wrap_err("Failed to bitcode-serialize VmExe while building VM verifying key")?;
-    let exe: VmExe<Val<SC>> = deserialize(&exe_bytes)
+    let exe: VmExe = deserialize(&exe_bytes)
         .wrap_err("Failed to bitcode-deserialize VmExe while building VM verifying key")?;
     let prover = sdk
         .prover(exe)
