@@ -31,8 +31,8 @@ version = 2
 yanked = "warn"
 # Each ignore is a transitive dep we can't push a fix for from this repo. The
 # direct chain runs through the openvm / stark-backend / halo2 graph; re-review
-# on every bump of those pins and after 2027-03-01. Last reviewed 2026-09-02
-# against openvm v2.1.0-rc.0 (RUSTSEC-2026-0097 dropped: no longer matches).
+# on every bump of those pins and after 2027-03-01. Last reviewed 2026-11-27
+# against openvm v2.1.0.
 ignore = [
     # bincode 1.x — workspace pins for backwards-compatible wire format.
     # Migration to 2.x ripples through proof/protocol and openvm-stark-sdk.
@@ -47,6 +47,13 @@ ignore = [
     # openvm v2.0.0-rc.2 circuit crates. Upstream-unmaintained, no safe upgrade;
     # build-only (not in any shipped artifact).
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; build-time, transitive via getset -> openvm rc.2" },
+    # crypto-bigint 0.5 — the timing fix ships only in 0.7.6. openvm-ecc-guest
+    # pulls 0.5 through elliptic-curve 0.13 / ecdsa 0.16; moving off it is
+    # upstream's call.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing variability; fixed only in 0.7, transitive via openvm-ecc-guest -> elliptic-curve 0.13" },
+    # chrono — unmaintained with no successor release. edge-manager and
+    # edge-worker use it directly; replacing it (jiff or time) is a separate change.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; direct dep of edge-manager and edge-worker, replacement tracked as follow-up" },
 ]
 
 # -----------------------------------------------------------------------------
